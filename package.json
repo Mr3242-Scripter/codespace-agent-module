@@ -1,0 +1,13 @@
+{
+  "name": "codespace-agent-playground",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "agent:start": "bash src/codespace/agent-service.sh start",
+    "agent:status": "bash src/codespace/agent-service.sh status",
+    "agent:stop": "bash src/codespace/agent-service.sh stop"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.3"
+  }
+}
