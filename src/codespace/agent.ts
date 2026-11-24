@@ -11,7 +11,7 @@ import { executeAdvanced } from "./advanced.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
-// PTY support is mandatory for this agent build: fail startup rather than silently disabling terminal resize.
+// PTY support is required: fail startup rather than silently disabling terminal resizing.
 const ptyModule = localRequire("node-pty");
 const baseUrl = (process.env.CODESPACE_AGENT_URL ?? "").replace(/\/+$/, "");
 const token = process.env.CODESPACE_AGENT_TOKEN ?? "";
@@ -166,8 +166,18 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "terminal.close": {
       const session = sessions.get(String(a.sessionId));
       if (!session) throw new Error("Unknown terminal session.");
-      if (!session.ended) session.child.kill("SIGTERM");
-      return { closed: true, alreadyEnded: session.ended };
+      const alreadyEnded = session.ended;
+      if (!alreadyEnded) {
+        session.child.kill("SIGTERM");
+        const gracefulDeadline = Date.now() + 1500;
+        while (!session.ended && Date.now() < gracefulDeadline) await new Promise(resolve => setTimeout(resolve, 25));
+        if (!session.ended) {
+          session.child.kill("SIGKILL");
+          const forceDeadline = Date.now() + 1000;
+          while (!session.ended && Date.now() < forceDeadline) await new Promise(resolve => setTimeout(resolve, 25));
+        }
+      }
+      return { closed: session.ended, alreadyEnded, exitCode: session.exitCode };
     }
     case "terminal.list":
       return [...sessions.entries()].map(([sessionId, session]) => ({ sessionId, command: session.command, pid: session.child.pid ?? null, running: !session.ended, exitCode: session.exitCode, createdAt: session.createdAt }));
@@ -182,7 +192,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "terminal.resize": {
       const session = sessions.get(String(a.sessionId));
       if (!session) throw new Error("Unknown terminal session.");
-      if (!session.pty || typeof session.child.resize !== "function") throw new Error("This terminal session has no PTY. Terminal sessions must be created with the required node-pty runtime.");
+      if (!session.pty || typeof session.child.resize !== "function") return { resized: false, available: false, reason: "This session was started without a pseudo-terminal. Install node-pty in the agent workspace and restart the agent to enable terminal resizing." };
       const cols = Number(a.cols), rows = Number(a.rows);
       if (!Number.isInteger(cols) || cols < 20 || cols > 500 || !Number.isInteger(rows) || rows < 5 || rows > 200) throw new Error("Terminal size must be 20-500 columns and 5-200 rows.");
       session.child.resize(cols, rows);
@@ -318,38 +328,90 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       return { found: false, candidates };
     }
     case "devcontainer.read_configuration":
-    case "devcontainer.validate":
-      return run("devcontainer", ["read-configuration", "--workspace-folder", root], root, 120_000);
-    case "devcontainer.build": {
-      if (a.confirm !== true) throw new Error("Building a Dev Container requires confirm=true.");
-      const args = ["build", "--workspace-folder", root];
-      if (a.config) args.push("--config", resolvePath(String(a.config)));
-      return run("devcontainer", args, root, 120_000);
+    case "devcontainer.validate": {
+      const candidates = [a.config ? String(a.config) : ".devcontainer/devcontainer.json", ".devcontainer.json"];
+      let selected: string | null = null, raw = "";
+      for (const candidate of candidates) {
+        try { selected = candidate; raw = await fs.readFile(resolvePath(candidate), "utf8"); break; }
+        catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+      }
+      if (!selected) return { valid: false, found: false, candidates, reason: "No devcontainer configuration file was found." };
+      try {
+        const config = JSON.parse(raw);
+        if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("Configuration root must be a JSON object.");
+        const issues: string[] = [];
+        if (!config.image && !config.build && !config.dockerFile && !config.dockerfile) issues.push("Specify image, build, or dockerFile.");
+        if (config.postStartCommand !== undefined && typeof config.postStartCommand !== "string" && typeof config.postStartCommand !== "object") issues.push("postStartCommand must be a string, array, or object.");
+        return { valid: issues.length === 0, found: true, path: selected, config, issues, validation: "static-json", note: "Docker-based schema/build validation requires the Codespaces host; this checks JSON structure and common required fields." };
+      } catch (error: any) {
+        return { valid: false, found: true, path: selected, error: error.message, validation: "json-parse" };
+      }
     }
+    case "devcontainer.build":
+      if (a.confirm !== true) throw new Error("Building a Dev Container requires confirm=true.");
+      return { available: false, requiresHostControlPlane: true, message: "A local image build cannot run inside the Codespace agent because the host Docker daemon is not mounted. Use devcontainer.up to request a Codespaces rebuild through GitHub CLI." };
     case "devcontainer.up": {
-      if (a.confirm !== true) throw new Error("Starting/rebuilding a Dev Container requires confirm=true.");
-      const args = ["up", "--workspace-folder", root];
-      if (a.config) args.push("--config", resolvePath(String(a.config)));
-      if (a.removeExistingContainer) args.push("--remove-existing-container");
-      return run("devcontainer", args, root, 120_000);
+      if (a.confirm !== true) throw new Error("Rebuilding a Codespace requires confirm=true.");
+      try {
+        const args = ["codespace", "rebuild", "--codespace", codespace, ...(a.removeExistingContainer ? ["--full"] : [])];
+        const result = await run("gh", args, root, 120_000);
+        return { requested: true, operation: "codespace-rebuild", ...result, note: "The Codespace may disconnect while GitHub rebuilds its container. The agent should reconnect through the configured postStartCommand." };
+      } catch (error: any) {
+        return { requested: false, available: false, reason: error?.message ?? String(error), fallback: "Run 'Codespaces: Rebuild Container' from the GitHub Codespaces Command Palette." };
+      }
     }
     case "devcontainer.exec": {
       const command = Array.isArray(a.command) ? a.command.map(String) : [];
       if (!command.length || command.length > 64 || command.some(part => part.length > 4096)) throw new Error("command must be a non-empty argv array (maximum 64 entries).");
-      return run("devcontainer", ["exec", "--workspace-folder", root, ...command], root, 120_000);
+      return run(command[0], command.slice(1), root, 120_000);
     }
     case "workspace.disk_usage": {
       const filesystem = await run("df", ["-h", root], root);
       const workspace = await run("du", ["-sh", "--exclude=node_modules", "--exclude=.git", root], root, 120_000);
       return { filesystem, workspace };
     }
-    case "ports.inspect": {
-      const args = ["-ltnup"];
+    case "ports.inspect":
+    case "ports.list": {
+      if (operation === "ports.list") {
+        try {
+          const forwarded = await run("gh", ["codespace", "ports", "--codespace", codespace, "--json", "sourcePort,visibility,browseUrl,label"], root, 15000);
+          return { source: "gh-codespace-ports", forwardedPorts: JSON.parse(forwarded.stdout || "[]") };
+        } catch {}
+      }
+      const listeners: Array<{ protocol: string; addressHex: string; port: number; state: string }> = [];
+      for (const [file, protocol] of [["/proc/net/tcp", "tcp"], ["/proc/net/tcp6", "tcp6"]] as const) {
+        try {
+          const lines = (await fs.readFile(file, "utf8")).trim().split(/\\r?\\n/).slice(1);
+          for (const line of lines) {
+            const fields = line.trim().split(/\\s+/);
+            if (fields.length < 4 || fields[3] !== "0A") continue;
+            const [addressHex, portHex] = fields[1].split(":");
+            const port = Number.parseInt(portHex, 16);
+            if (a.port !== undefined && port !== Number(a.port)) continue;
+            listeners.push({ protocol, addressHex, port, state: "LISTEN" });
+          }
+        } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+      }
+      if (listeners.length || await fs.access("/proc/net/tcp").then(()=>true).catch(()=>false)) {
+        return { source: "/proc/net/tcp", listeners, count: listeners.length, forwardedPortsAvailable: false, note: "Local listening sockets are shown. Install/authenticate GitHub CLI to retrieve forwarded-port metadata with gh codespace ports." };
+      }
+      const args = ["-ltn"];
       if (a.port !== undefined) args.push("sport", "=", `:${Number(a.port)}`);
-      try { return await run("ss", args); }
-      catch { return run("netstat", ["-lntup"]); }
+      const ss = await run("ss", args).catch(async () => run("netstat", ["-lnt"]));
+      return { ...ss, source: "ss/netstat-fallback" };
     }
-    case "ports.list": return run("bash", ["-lc", "ss -ltnup 2>/dev/null || netstat -lntup 2>/dev/null || true"]);
+    case "ports.update": {
+      const port = Number(a.port);
+      const visibility = String(a.visibility);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be between 1 and 65535.");
+      if (!["private", "org", "public"].includes(visibility)) throw new Error("visibility must be private, org, or public.");
+      try {
+        const result = await run("gh", ["codespace", "ports", "visibility", `${port}:${visibility}`, "--codespace", codespace], root, 30000);
+        return { updated: true, available: true, codespace, port, visibility, ...result };
+      } catch (error: any) {
+        return { updated: false, available: false, codespace, port, visibility, reason: error?.code === "ENOENT" ? "GitHub CLI (gh) is not installed in this Codespace." : error?.message ?? String(error), installHint: "Install the GitHub CLI or add the official github-cli Dev Container feature, then restart the agent." };
+      }
+    }
     case "ports.check": {
       const port = Number(a.port);
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be between 1 and 65535.");
@@ -411,7 +473,28 @@ export async function runCodespaceAgent(): Promise<void> {
   const stop = () => { stopping = true; };
   process.once("SIGINT", stop); process.once("SIGTERM", stop);
   console.log(`Codespaces agent connected for ${codespace}; workspace ${root}`);
+  let heartbeatInFlight = false;
+  const sendHeartbeat = async () => {
+    if (heartbeatInFlight || stopping) return;
+    heartbeatInFlight = true;
+    try {
+      const response = await request(`${baseUrl}/codespaces/agent/heartbeat`, {
+        method: "POST",
+        body: JSON.stringify({ codespace }),
+        signal: AbortSignal.timeout(10_000)
+      });
+      if (!response.ok) throw new Error(`Heartbeat failed: ${response.status}`);
+    } catch (error) {
+      if (!stopping) console.error("Codespaces agent heartbeat error:", error);
+    } finally {
+      heartbeatInFlight = false;
+    }
+  };
+  await sendHeartbeat();
+  const heartbeatTimer = setInterval(() => { void sendHeartbeat(); }, 20_000);
+  heartbeatTimer.unref?.();
   let backoff = 1000;
+  try {
   while (!stopping) {
     try {
       const poll = await request(`${baseUrl}/codespaces/agent/poll?name=${encodeURIComponent(codespace)}`);
@@ -441,6 +524,9 @@ export async function runCodespaceAgent(): Promise<void> {
       console.error("Codespaces agent connection error:",error);
       await delay(backoff); backoff=Math.min(backoff*2,30000);
     }
+  }
+  } finally {
+    clearInterval(heartbeatTimer);
   }
   console.log(`Codespaces agent stopped for ${codespace}`);
 }
