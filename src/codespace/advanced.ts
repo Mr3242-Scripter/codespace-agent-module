@@ -39,6 +39,27 @@ async function command(bin: string, args: string[], timeout = 15000) {
     return { available: !missing, exitCode: typeof error?.code === "number" ? error.code : null, stdout: error?.stdout ?? "", stderr: error?.stderr ?? error?.message ?? String(error), ...(missing ? { reason: `${bin} executable is not installed in the Codespace agent container.` } : {}) };
   }
 }
+async function dockerEngineStatus() {
+  const cli = await command("docker", ["--version"], 5000);
+  if (!cli.available || cli.exitCode !== 0) {
+    return { cliAvailable: false, daemonAvailable: false, scope: "nested-docker-engine", reason: cli.reason ?? cli.stderr ?? "Docker CLI is unavailable." };
+  }
+  const info = await command("docker", ["info", "--format", "{{json .}}"], 10000);
+  if (!info.available || info.exitCode !== 0) {
+    return { cliAvailable: true, daemonAvailable: false, scope: "nested-docker-engine", reason: info.stderr || "Docker CLI is installed, but the nested Docker daemon is not reachable." };
+  }
+  let parsed: any = {};
+  try { parsed = JSON.parse(info.stdout.trim()); } catch {}
+  return {
+    cliAvailable: true,
+    daemonAvailable: true,
+    scope: "nested-docker-engine",
+    serverVersion: parsed.ServerVersion ?? null,
+    containers: typeof parsed.Containers === "number" ? parsed.Containers : null,
+    images: typeof parsed.Images === "number" ? parsed.Images : null,
+    operatingSystem: parsed.OperatingSystem ?? null
+  };
+}
 async function walk(dir: string, base: string, files: Array<{path:string;size:number;modifiedAt:string}>, limit: number): Promise<void> {
   if (files.length >= limit) return;
   for (const item of await fs.readdir(dir, { withFileTypes: true })) {
@@ -349,24 +370,37 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       return {closed:true,alreadyEnded:session.ended};
     }
     case "workspace.monitor": {
-      const [disk, df] = await Promise.all([fs.stat(root), command("df",["-Pk",root])]);
+      const [disk, df, dockerEngine] = await Promise.all([fs.stat(root), command("df",["-Pk",root]), dockerEngineStatus()]);
       const memory = process.memoryUsage();
-      return { sampledAt:new Date().toISOString(), uptimeSeconds:Math.floor(process.uptime()), loadAverage:os.loadavg(), cpuCount:os.cpus().length, memory:{total:os.totalmem(),free:os.freemem(),process:memory}, workspace:{root,modifiedAt:disk.mtime.toISOString()}, disk:df, containers:{available:false,reason:"The agent runs inside the Codespace container and cannot inspect the parent Docker host."} };
+      return {
+        sampledAt:new Date().toISOString(), uptimeSeconds:Math.floor(process.uptime()), loadAverage:os.loadavg(), cpuCount:os.cpus().length,
+        memory:{total:os.totalmem(),free:os.freemem(),process:memory},
+        workspace:{root,modifiedAt:disk.mtime.toISOString()}, disk:df,
+        containers:{available:dockerEngine.daemonAvailable,scope:"nested-docker-engine",count:dockerEngine.containers,reason:dockerEngine.reason},
+        hostContainers:{available:false,reason:"The Codespaces host container is outside the development container's Docker namespace."}
+      };
     }
     case "workspace.diagnostics": {
-      const [git, versions] = await Promise.all([
+      const [git, versions, dockerEngine] = await Promise.all([
         command("git",["status","--short","--branch"]),
         Promise.all(["node","npm","git","gh","code","devcontainer","docker"].map(async name => {
           const result = await command(name,["--version"],5000);
           return {name,available:result.available && result.exitCode===0,version:result.available ? (result.stdout||result.stderr).trim().split("\n")[0] : null,reason:result.available ? undefined : result.reason};
-        }))
+        })),
+        dockerEngineStatus()
       ]);
       let devcontainer: unknown = {found:false};
       for (const relative of [".devcontainer/devcontainer.json",".devcontainer.json"]) {
         try { const raw=await fs.readFile(path.join(root,relative),"utf8"); JSON.parse(raw); devcontainer={found:true,path:relative,valid:true,validation:"static-json"}; break; }
         catch(error:any) { if(error?.code==="ENOENT") continue; devcontainer={found:true,path:relative,valid:false,error:error.message}; break; }
       }
-      return {generatedAt:new Date().toISOString(),agent:{uptimeSeconds:Math.floor(process.uptime()),startedAt:new Date(Date.now()-process.uptime()*1000).toISOString()},workspace:root,git,devcontainer,hostContainerControl:{available:false,reason:"Docker and Dev Container CLI are host-level tools and are not available from inside the agent container."},tools:versions};
+      return {
+        generatedAt:new Date().toISOString(),
+        agent:{uptimeSeconds:Math.floor(process.uptime()),startedAt:new Date(Date.now()-process.uptime()*1000).toISOString()},
+        workspace:root,git,devcontainer,dockerEngine,
+        hostContainerControl:{available:false,reason:"The agent can manage its nested Docker-in-Docker engine, but cannot inspect or control the parent Codespaces host container."},
+        tools:versions
+      };
     }
     case "workspace.health": return {ok:true,codespace:process.env.CODESPACE_NAME??null,workspace:root,uptimeSeconds:Math.floor(process.uptime()),agentStartedAt:new Date(startedAt).toISOString(),pid:process.pid,node:process.version};
     case "fs.apply_edits": return applyEdits(a);
@@ -374,9 +408,33 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
     case "vscode.config": if(a.action==="write"&&a.confirm!==true)throw new Error("Writing VS Code configuration requires confirm=true."); return vscodeConfig(a);
     case "devcontainer.logs":
     case "devcontainer.list_containers": {
-      const socketAvailable = await fs.access("/var/run/docker.sock").then(()=>true).catch(()=>false);
-      const docker = await command("docker",["--version"]);
-      return {available:false,operation,hostDockerCli:docker.available,hostDockerSocket:socketAvailable,reason:"The Codespaces agent runs inside the development container. Docker CLI/socket access belongs to the Codespaces host and is not mounted into this container. Use the Codespaces creation log or Rebuild Container action for host-container diagnostics."};
+      const engine = await dockerEngineStatus();
+      if (!engine.daemonAvailable) {
+        return {available:false,operation,...engine,reason:engine.reason ?? "Docker-in-Docker is not ready. Rebuild the Codespace after enabling the Docker-in-Docker feature."};
+      }
+      if (operation === "devcontainer.list_containers") {
+        const result = await command("docker",["ps","--all","--no-trunc","--format","{{json .}}"],30000);
+        if (result.exitCode !== 0) throw new Error(result.stderr || "Unable to list nested Docker containers.");
+        const containers = result.stdout.split("\n").filter(Boolean).map((line:string) => {
+          try { return JSON.parse(line); } catch { return {raw:line}; }
+        });
+        return {available:true,scope:"nested-docker-engine",containers};
+      }
+      const containerId = String(a.containerId ?? "").trim();
+      if (!containerId || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(containerId)) {
+        throw new Error("A valid nested Docker containerId is required to retrieve logs.");
+      }
+      const tail = Math.min(2000,Math.max(1,Number(a.tail) || 100));
+      const args = ["logs","--tail",String(tail)];
+      if (a.since !== undefined) {
+        const since = String(a.since);
+        if (!since || since.length > 128 || !/^[A-Za-z0-9:._+-]+$/.test(since)) throw new Error("Invalid Docker logs since value.");
+        args.push("--since",since);
+      }
+      args.push(containerId);
+      const result = await command("docker",args,30000);
+      if (result.exitCode !== 0) throw new Error(result.stderr || "Unable to retrieve nested Docker container logs.");
+      return {available:true,scope:"nested-docker-engine",containerId,stdout:result.stdout,stderr:result.stderr};
     }
     default: return undefined;
   }
