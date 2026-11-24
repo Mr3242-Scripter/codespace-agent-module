@@ -11,8 +11,8 @@ import { executeAdvanced } from "./advanced.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
-let ptyModule: any = null;
-try { ptyModule = localRequire("node-pty"); } catch {}
+// PTY support is mandatory for this agent build: fail startup rather than silently disabling terminal resize.
+const ptyModule = localRequire("node-pty");
 const baseUrl = (process.env.CODESPACE_AGENT_URL ?? "").replace(/\/+$/, "");
 const token = process.env.CODESPACE_AGENT_TOKEN ?? "";
 const codespace = process.env.CODESPACE_NAME ?? "";
@@ -182,7 +182,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "terminal.resize": {
       const session = sessions.get(String(a.sessionId));
       if (!session) throw new Error("Unknown terminal session.");
-      if (!session.pty || typeof session.child.resize !== "function") throw new Error("PTY resizing is unavailable. Install node-pty in the Codespace agent environment and restart the agent.");
+      if (!session.pty || typeof session.child.resize !== "function") throw new Error("This terminal session has no PTY. Terminal sessions must be created with the required node-pty runtime.");
       const cols = Number(a.cols), rows = Number(a.rows);
       if (!Number.isInteger(cols) || cols < 20 || cols > 500 || !Number.isInteger(rows) || rows < 5 || rows > 200) throw new Error("Terminal size must be 20-500 columns and 5-200 rows.");
       session.child.resize(cols, rows);
