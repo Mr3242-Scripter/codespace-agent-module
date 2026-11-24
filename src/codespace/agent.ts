@@ -414,7 +414,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       const candidates = [".devcontainer/devcontainer.json", ".devcontainer.json"];
       for (const relative of candidates) {
         const file = resolvePath(relative);
-        try { return { path: relative, content: await fs.readFile(file, "utf8") }; }
+        try { return { path: relative, text: await fs.readFile(file, "utf8") }; }
         catch (error: any) { if (error?.code !== "ENOENT") throw error; }
       }
       return { found: false, candidates };
