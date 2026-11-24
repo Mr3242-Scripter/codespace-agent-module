@@ -2,6 +2,8 @@
 set -euo pipefail
 ACTION="${1:-status}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "$ROOT/../.." && pwd)"
+export PATH="$WORKSPACE_ROOT/node_modules/.bin:$PATH"
 PID_FILE="${CODESPACE_AGENT_PID_FILE:-$HOME/.codespace-agent.pid}"
 LOG_FILE="${CODESPACE_AGENT_LOG_FILE:-$HOME/.codespace-agent.log}"
 log() { local message="$*"; printf '[%s] %s\n' "$(date -Is)" "$message" | tee -a "$LOG_FILE" >&2; }
