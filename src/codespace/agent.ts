@@ -78,11 +78,21 @@ function resolvePath(input = "."): string {
   }
   return resolved;
 }
+async function resolveExecutable(command: string): Promise<string> {
+  if (command.includes(path.sep)) return command;
+  const searchPath = process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  for (const directory of searchPath.split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(directory, command);
+    try { await fs.access(candidate, 1); return candidate; } catch {}
+  }
+  throw new Error(`Executable not found on PATH: ${command}`);
+}
 async function run(command: string, args: string[], cwd = root, timeout = 30_000) {
   const safeCwd = resolvePath(cwd);
+  const executable = await resolveExecutable(command);
   const timeoutMs = Math.min(Math.max(timeout, 1000), 120_000);
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawn(executable, args, {
       cwd: safeCwd, env: process.env, stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32", windowsHide: true
     });
