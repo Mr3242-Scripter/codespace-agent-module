@@ -33,13 +33,21 @@ function startSession(command: string, cwd = root, usePty = false) {
     session.child.onData(append);
     session.child.onExit((event: { exitCode: number }) => { session.ended = true; session.exitCode = event.exitCode; });
   } else {
-    session.child = spawn("bash", ["-lc", command], { cwd: safeCwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    session.child = spawn("bash", ["-lc", command], { cwd: safeCwd, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     session.child.stdout.on("data", append);
     session.child.stderr.on("data", append);
     session.child.on("close", (code: number | null) => { session.ended = true; session.exitCode = code; });
   }
   sessions.set(id, session);
   return { sessionId: id, pid: session.child.pid ?? null, pty: session.pty };
+}
+function signalSession(session: Session, signal: NodeJS.Signals): boolean {
+  const pid = Number(session.child.pid);
+  if (Number.isSafeInteger(pid) && pid > 1) {
+    try { process.kill(-pid, signal); return true; }
+    catch (error: any) { if (error?.code !== "ESRCH" && error?.code !== "EINVAL" && error?.code !== "EPERM") throw error; }
+  }
+  try { return Boolean(session.child.kill(signal)); } catch { return false; }
 }
 function readSession(id: string, clear = false) {
   const session = sessions.get(id);
@@ -168,11 +176,11 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       if (!session) throw new Error("Unknown terminal session.");
       const alreadyEnded = session.ended;
       if (!alreadyEnded) {
-        session.child.kill("SIGTERM");
+        signalSession(session, "SIGTERM");
         const gracefulDeadline = Date.now() + 1500;
         while (!session.ended && Date.now() < gracefulDeadline) await new Promise(resolve => setTimeout(resolve, 25));
         if (!session.ended) {
-          session.child.kill("SIGKILL");
+          signalSession(session, "SIGKILL");
           const forceDeadline = Date.now() + 1000;
           while (!session.ended && Date.now() < forceDeadline) await new Promise(resolve => setTimeout(resolve, 25));
         }
@@ -187,7 +195,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       const signal = String(a.signal ?? "SIGTERM");
       if (!["SIGINT", "SIGTERM", "SIGHUP", "SIGKILL", "SIGUSR1", "SIGUSR2"].includes(signal)) throw new Error("Unsupported terminal signal.");
       if (session.ended) return { signalled: false, alreadyEnded: true };
-      return { signalled: session.child.kill(signal as NodeJS.Signals), signal };
+      return { signalled: signalSession(session, signal as NodeJS.Signals), signal };
     }
     case "terminal.resize": {
       const session = sessions.get(String(a.sessionId));
@@ -305,8 +313,35 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       }));
       return checks;
     }
-    case "vscode.extensions.list":
-      return run("code", ["--list-extensions", "--show-versions"]);
+    case "vscode.extensions.list": {
+      try {
+        const result = await run("code", ["--list-extensions", "--show-versions"]);
+        return { ...result, source: "code-cli" };
+      } catch (error: any) {
+        const candidates = [
+          process.env.CODESPACE_VSCODE_FOLDER ? path.join(process.env.CODESPACE_VSCODE_FOLDER, "extensions") : "",
+          path.join(os.homedir(), ".vscode-remote", "extensions"),
+          path.join(os.homedir(), ".vscode-server", "extensions"),
+          "/home/codespace/.vscode-remote/extensions"
+        ].filter(Boolean);
+        const extensions: Array<{ id: string; version: string; path: string }> = [];
+        for (const directory of [...new Set(candidates)]) {
+          let entries: string[];
+          try { entries = await fs.readdir(directory); } catch { continue; }
+          for (const entry of entries) {
+            const manifest = path.join(directory, entry, "package.json");
+            try {
+              const pkg = JSON.parse(await fs.readFile(manifest, "utf8"));
+              if (typeof pkg.publisher === "string" && typeof pkg.name === "string") {
+                extensions.push({ id: `${pkg.publisher}.${pkg.name}`, version: String(pkg.version ?? "unknown"), path: path.join(directory, entry) });
+              }
+            } catch {}
+          }
+        }
+        if (extensions.length) return { source: "extension-directory-fallback", extensions };
+        throw new Error(`Could not list VS Code extensions with the CLI or inspect known extension directories: ${error?.message ?? String(error)}`);
+      }
+    }
     case "vscode.extensions.install": {
       const id = String(a.extensionId ?? "");
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$/.test(id)) throw new Error("A valid publisher.extension identifier is required.");
