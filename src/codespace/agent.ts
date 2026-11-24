@@ -41,13 +41,16 @@ function startSession(command: string, cwd = root, usePty = false) {
   sessions.set(id, session);
   return { sessionId: id, pid: session.child.pid ?? null, pty: session.pty };
 }
-function signalSession(session: Session, signal: NodeJS.Signals): boolean {
-  const pid = Number(session.child.pid);
-  if (Number.isSafeInteger(pid) && pid > 1) {
+function signalChildTree(child: any, signal: NodeJS.Signals): boolean {
+  const pid = Number(child?.pid);
+  if (process.platform !== "win32" && Number.isSafeInteger(pid) && pid > 1) {
     try { process.kill(-pid, signal); return true; }
     catch (error: any) { if (error?.code !== "ESRCH" && error?.code !== "EINVAL" && error?.code !== "EPERM") throw error; }
   }
-  try { return Boolean(session.child.kill(signal)); } catch { return false; }
+  try { return Boolean(child?.kill(signal)); } catch { return false; }
+}
+function signalSession(session: Session, signal: NodeJS.Signals): boolean {
+  return signalChildTree(session.child, signal);
 }
 function readSession(id: string, clear = false) {
   const session = sessions.get(id);
@@ -77,13 +80,60 @@ function resolvePath(input = "."): string {
 }
 async function run(command: string, args: string[], cwd = root, timeout = 30_000) {
   const safeCwd = resolvePath(cwd);
-  const { stdout, stderr } = await execFileAsync(command, args, {
-    cwd: safeCwd,
-    timeout: Math.min(Math.max(timeout, 1000), 120_000),
-    maxBuffer: 2 * 1024 * 1024,
-    windowsHide: true
+  const timeoutMs = Math.min(Math.max(timeout, 1000), 120_000);
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: safeCwd, env: process.env, stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32", windowsHide: true
+    });
+    let stdout = "", stderr = "", totalBytes = 0, timedOut = false, overflow = false, settled = false;
+    let forceTimer: ReturnType<typeof setTimeout> | undefined;
+    const signalTree = (signal: NodeJS.Signals) => {
+      const pid = Number(child.pid);
+      if (process.platform !== "win32" && Number.isSafeInteger(pid) && pid > 1) {
+        try { process.kill(-pid, signal); return; }
+        catch (error: any) { if (error?.code !== "ESRCH" && error?.code !== "EINVAL" && error?.code !== "EPERM") throw error; }
+      }
+      try { child.kill(signal); } catch {}
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      signalTree("SIGTERM");
+      forceTimer = setTimeout(() => signalTree("SIGKILL"), 1000);
+    }, timeoutMs);
+    const finish = (error?: Error, value?: { stdout: string; stderr: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (error) reject(error); else resolve(value ?? { stdout, stderr });
+    };
+    const collect = (target: "stdout" | "stderr", chunk: Buffer) => {
+      totalBytes += chunk.length;
+      if (target === "stdout") stdout = (stdout + chunk.toString()).slice(-2 * 1024 * 1024);
+      else stderr = (stderr + chunk.toString()).slice(-2 * 1024 * 1024);
+      if (totalBytes > 2 * 1024 * 1024 && !overflow) {
+        overflow = true;
+        signalTree("SIGTERM");
+        forceTimer = setTimeout(() => signalTree("SIGKILL"), 1000);
+      }
+    };
+    child.stdout.on("data", (chunk: Buffer) => collect("stdout", chunk));
+    child.stderr.on("data", (chunk: Buffer) => collect("stderr", chunk));
+    child.once("error", (error: Error) => finish(error));
+    child.once("close", (code: number | null) => {
+      if (timedOut) return finish(new Error(`Command timed out after ${timeoutMs}ms: ${command} ${args.join(" ")}`));
+      if (overflow) return finish(new Error(`Command output exceeded the 2 MiB limit: ${command} ${args.join(" ")}`));
+      if (code !== 0) {
+        const error: any = new Error(`Command failed: ${command} ${args.join(" ")}\n${stderr || `exit code ${code}`}`);
+        error.code = code;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        return finish(error);
+      }
+      finish(undefined, { stdout, stderr });
+    });
   });
-  return { stdout, stderr };
 }
 async function execute(operation: string, a: Record<string, any>): Promise<unknown> {
   const advanced = await executeAdvanced(operation, a);
@@ -213,13 +263,16 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "process.kill": {
       const pid = Number(a.pid);
       if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) throw new Error("Refusing to signal a protected or invalid PID.");
-      process.kill(pid, "SIGTERM"); return { signalled: true, pid, signal: "SIGTERM" };
+      const session = [...sessions.values()].find(item => Number(item.child.pid) === pid);
+      if (session) signalSession(session, "SIGTERM"); else process.kill(pid, "SIGTERM");
+      return { signalled: true, pid, signal: "SIGTERM" };
     }
     case "process.signal": {
       const pid = Number(a.pid), signal = String(a.signal ?? "SIGTERM");
       if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) throw new Error("Refusing to signal a protected or invalid PID.");
       if (!["SIGINT", "SIGTERM", "SIGHUP", "SIGKILL", "SIGUSR1", "SIGUSR2"].includes(signal)) throw new Error("Unsupported process signal.");
-      process.kill(pid, signal as NodeJS.Signals);
+      const session = [...sessions.values()].find(item => Number(item.child.pid) === pid);
+      if (session) signalSession(session, signal as NodeJS.Signals); else process.kill(pid, signal as NodeJS.Signals);
       return { signalled: true, pid, signal };
     }
     case "git.status": return run("git", ["status", "--short", "--branch"], a.cwd ? resolvePath(a.cwd) : root);
@@ -237,7 +290,11 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "git.fetch": return run("git", ["fetch", a.remote ?? "origin"], a.cwd ? resolvePath(a.cwd) : root, 120_000);
     case "git.add": {
       const cwd = a.cwd ? resolvePath(a.cwd) : root;
-      const paths = (a.paths ?? ["."]).map((p: string) => path.relative(cwd, resolvePath(p)));
+      const paths = (a.paths ?? ["."]).map((p: string) => {
+        const absolute = path.resolve(cwd, p);
+        const safe = resolvePath(path.relative(root, absolute));
+        return path.relative(cwd, safe) || ".";
+      });
       return run("git", ["add", "--", ...paths], cwd, 120_000);
     }
     case "git.reset": {
@@ -270,10 +327,10 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "debug.start": {
       const command = Array.isArray(a.command) ? a.command.map(String) : [];
       if (!command.length || command.length > 64 || command.some(part => part.length > 4096)) throw new Error("Debug adapter command must be a non-empty argv array.");
-      const child = spawn(command[0], command.slice(1), { cwd: a.cwd ? resolvePath(a.cwd) : root, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+      const child = spawn(command[0], command.slice(1), { cwd: a.cwd ? resolvePath(a.cwd) : root, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
       const id = randomUUID();
       const session: DebugSession = { child, buffer: Buffer.alloc(0), messages: [], stderr: "", ended: false, exitCode: null };
-      child.stdout.on("data", (chunk: Buffer) => { try { session.buffer = Buffer.concat([session.buffer, chunk]); parseDebugMessages(session); } catch (error) { session.stderr = (session.stderr + (error instanceof Error ? error.message : String(error))).slice(-50_000); child.kill("SIGTERM"); } });
+      child.stdout.on("data", (chunk: Buffer) => { try { session.buffer = Buffer.concat([session.buffer, chunk]); parseDebugMessages(session); } catch (error) { session.stderr = (session.stderr + (error instanceof Error ? error.message : String(error))).slice(-50_000); signalChildTree(child, "SIGTERM"); } });
       child.stderr.on("data", (chunk: Buffer) => { session.stderr = (session.stderr + chunk.toString("utf8")).slice(-50_000); });
       child.on("close", (code: number | null) => { session.ended = true; session.exitCode = code; });
       child.on("error", (error: Error) => { session.stderr = (session.stderr + error.message).slice(-50_000); session.ended = true; });
@@ -299,7 +356,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "debug.close": {
       const session = debugSessions.get(String(a.sessionId));
       if (!session) throw new Error("Unknown debug adapter session.");
-      if (!session.ended) session.child.kill("SIGTERM");
+      if (!session.ended) signalChildTree(session.child, "SIGTERM");
       return { closed: true, alreadyEnded: session.ended };
     }
     case "environment.info": {
