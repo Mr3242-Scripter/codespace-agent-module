@@ -1,7 +1,7 @@
 {
   "name": "Codespaces Agent Playground",
   "image": "mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm",
-  "postCreateCommand": "npm install",
+  "postCreateCommand": "npm install && npm run agent:check-deps",
   "postStartCommand": "bash src/codespace/agent-service.sh start",
   "postAttachCommand": "bash src/codespace/agent-service.sh start"
 }
