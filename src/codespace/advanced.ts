@@ -35,7 +35,8 @@ async function command(bin: string, args: string[], timeout = 15000) {
     const result = await execFileAsync(bin, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
     return { available: true, exitCode: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (error: any) {
-    return { available: true, exitCode: typeof error?.code === "number" ? error.code : null, stdout: error?.stdout ?? "", stderr: error?.stderr ?? error?.message ?? String(error) };
+    const missing = error?.code === "ENOENT";
+    return { available: !missing, exitCode: typeof error?.code === "number" ? error.code : null, stdout: error?.stdout ?? "", stderr: error?.stderr ?? error?.message ?? String(error), ...(missing ? { reason: `${bin} executable is not installed in the Codespace agent container.` } : {}) };
   }
 }
 async function walk(dir: string, base: string, files: Array<{path:string;size:number;modifiedAt:string}>, limit: number): Promise<void> {
@@ -148,15 +149,41 @@ async function runTask(task: string, args: string[] = [], timeoutMs = 120000) {
   let pkg:any=null;
   try{pkg=JSON.parse(await fs.readFile(safePath("package.json"),"utf8"));}catch(error:any){if(error?.code!=="ENOENT")throw error;}
   const scripts=pkg?.scripts??{};
-  if(!Object.prototype.hasOwnProperty.call(scripts,task))throw new Error(`Task '${task}' is not defined in package.json.`);
   const files=await fs.readdir(root);
   const manager=files.includes("pnpm-lock.yaml")?"pnpm":files.includes("yarn.lock")?"yarn":files.includes("bun.lockb")||files.includes("bun.lock")?"bun":"npm";
-  const commandArgs=manager==="npm"?["run",task,"--",...args]:manager==="pnpm"?["run",task,...args]:manager==="yarn"?["run",task,...args]:["run",task,...args];
+  let executable=manager, commandArgs:string[];
+  if(Object.prototype.hasOwnProperty.call(scripts,task)) {
+    commandArgs=manager==="npm"?["run",task,"--",...args]:["run",task,...args];
+  } else if(task==="test") {
+    const tests:string[]=[];
+    async function findTests(dir:string):Promise<void>{
+      for(const entry of await fs.readdir(dir,{withFileTypes:true})){
+        if([".git","node_modules",".venv","dist","build"].includes(entry.name))continue;
+        const full=path.join(dir,entry.name);
+        if(entry.isDirectory())await findTests(full);
+        else if(entry.isFile()&&/\.(?:test|spec)\.(?:js|mjs|cjs|ts|tsx|jsx)$/i.test(entry.name))tests.push(path.relative(root,full));
+        if(tests.length>=500)return;
+      }
+    }
+    await findTests(root);
+    if(!tests.length)return {task,manager,skipped:true,exitCode:0,stdout:"",stderr:"",reason:"No package.json test script or discoverable *.test.* / *.spec.* files exist in this workspace."};
+    executable="node";
+    const usesTs=tests.some(file=>/\.(?:ts|tsx)$/.test(file));
+    commandArgs=[...(usesTs&&await fs.access(path.join(root,"node_modules/tsx")).then(()=>true).catch(()=>false)?["--import","tsx"]:[]),"--test",...tests,...args];
+  } else if(task==="build"&&await fs.access(path.join(root,"tsconfig.json")).then(()=>true).catch(()=>false)) {
+    const tsc=path.join(root,"node_modules/.bin/tsc");
+    if(!await fs.access(tsc).then(()=>true).catch(()=>false))return {task,manager,exitCode:127,stdout:"",stderr:"No build script is defined and TypeScript compiler is not installed."};
+    executable=tsc;commandArgs=["--noEmit",...args];
+  } else if (task === "build") {
+    return {task,manager,skipped:true,exitCode:0,stdout:"",stderr:"",reason:"No package.json build script or tsconfig.json is present in this workspace."};
+  } else {
+    return {task,manager,exitCode:1,stdout:"",stderr:`Task '${task}' is not defined in package.json and no safe automatic fallback applies.`};
+  }
   try{
-    const result=await execFileAsync(manager,commandArgs,{cwd:root,timeout:Math.min(Math.max(timeoutMs,1000),600000),maxBuffer:8*1024*1024,windowsHide:true});
-    return {task,manager,exitCode:0,stdout:result.stdout,stderr:result.stderr};
+    const result=await execFileAsync(executable,commandArgs,{cwd:root,timeout:Math.min(Math.max(timeoutMs,1000),600000),maxBuffer:8*1024*1024,windowsHide:true});
+    return {task,manager,runner:executable,exitCode:0,stdout:result.stdout,stderr:result.stderr};
   }catch(error:any){
-    return {task,manager,exitCode:typeof error?.code==="number"?error.code:null,stdout:error?.stdout??"",stderr:error?.stderr??error?.message??String(error)};
+    return {task,manager,runner:executable,exitCode:typeof error?.code==="number"?error.code:null,stdout:error?.stdout??"",stderr:error?.stderr??error?.message??String(error)};
   }
 }
 
@@ -286,7 +313,7 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
     case "workspace.run_tests": if(a.confirm!==true)throw new Error("Running tests requires confirm=true."); return runTask("test",Array.isArray(a.args)?a.args.map(String):[],Number(a.timeoutMs??300000));
     case "workspace.run_build": if(a.confirm!==true)throw new Error("Running a build requires confirm=true."); return runTask("build",Array.isArray(a.args)?a.args.map(String):[],Number(a.timeoutMs??300000));
     case "workspace.language_servers": {
-      const names=["typescript-language-server","pyright-langserver","rust-analyzer","gopls","clangd","vscode-eslint-language-server","solargraph","jdtls"];
+      const names=["typescript-language-server","pyright-langserver","bash-language-server","yaml-language-server","vscode-json-language-server","vscode-html-language-server","vscode-css-language-server","rust-analyzer","gopls","clangd","vscode-eslint-language-server","solargraph","jdtls"];
       return Promise.all(names.map(async name=>({name,available:(await command("which",[name],3000)).exitCode===0})));
     }
     case "lsp.start": {
@@ -322,38 +349,35 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       return {closed:true,alreadyEnded:session.ended};
     }
     case "workspace.monitor": {
-      const [disk, df, docker] = await Promise.all([
-        fs.stat(root),
-        command("df",["-Pk",root]),
-        command("docker",["stats","--no-stream","--format","{{json .}}"])
-      ]);
+      const [disk, df] = await Promise.all([fs.stat(root), command("df",["-Pk",root])]);
       const memory = process.memoryUsage();
-      return { sampledAt:new Date().toISOString(), uptimeSeconds:Math.floor(process.uptime()), loadAverage:os.loadavg(), cpuCount:os.cpus().length, memory:{total:os.totalmem(),free:os.freemem(),process:memory}, workspace:{root,modifiedAt:disk.mtime.toISOString()}, disk:df, containers:docker };
+      return { sampledAt:new Date().toISOString(), uptimeSeconds:Math.floor(process.uptime()), loadAverage:os.loadavg(), cpuCount:os.cpus().length, memory:{total:os.totalmem(),free:os.freemem(),process:memory}, workspace:{root,modifiedAt:disk.mtime.toISOString()}, disk:df, containers:{available:false,reason:"The agent runs inside the Codespace container and cannot inspect the parent Docker host."} };
     }
     case "workspace.diagnostics": {
-      const [git, devcontainer, docker, versions] = await Promise.all([
+      const [git, versions] = await Promise.all([
         command("git",["status","--short","--branch"]),
-        command("devcontainer",["read-configuration","--workspace-folder",root],30000),
-        command("docker",["ps","--format","{{.ID}} {{.Names}} {{.Status}}"]),
         Promise.all(["node","npm","git","gh","code","devcontainer","docker"].map(async name => {
           const result = await command(name,["--version"],5000);
-          return {name,available:result.exitCode===0,version:(result.stdout||result.stderr).trim().split("\n")[0]};
+          return {name,available:result.available && result.exitCode===0,version:result.available ? (result.stdout||result.stderr).trim().split("\n")[0] : null,reason:result.available ? undefined : result.reason};
         }))
       ]);
-      return {generatedAt:new Date().toISOString(),agent:{uptimeSeconds:Math.floor(process.uptime()),startedAt:new Date(Date.now()-process.uptime()*1000).toISOString()},workspace:root,git,devcontainer,docker,tools:versions};
+      let devcontainer: unknown = {found:false};
+      for (const relative of [".devcontainer/devcontainer.json",".devcontainer.json"]) {
+        try { const raw=await fs.readFile(path.join(root,relative),"utf8"); JSON.parse(raw); devcontainer={found:true,path:relative,valid:true,validation:"static-json"}; break; }
+        catch(error:any) { if(error?.code==="ENOENT") continue; devcontainer={found:true,path:relative,valid:false,error:error.message}; break; }
+      }
+      return {generatedAt:new Date().toISOString(),agent:{uptimeSeconds:Math.floor(process.uptime()),startedAt:new Date(Date.now()-process.uptime()*1000).toISOString()},workspace:root,git,devcontainer,hostContainerControl:{available:false,reason:"Docker and Dev Container CLI are host-level tools and are not available from inside the agent container."},tools:versions};
     }
     case "workspace.health": return {ok:true,codespace:process.env.CODESPACE_NAME??null,workspace:root,uptimeSeconds:Math.floor(process.uptime()),agentStartedAt:new Date(startedAt).toISOString(),pid:process.pid,node:process.version};
     case "fs.apply_edits": return applyEdits(a);
     case "fs.sync": if(a.direction==="upload"&&a.confirm!==true)throw new Error("Uploading batch files requires confirm=true."); return syncFiles(a);
     case "vscode.config": if(a.action==="write"&&a.confirm!==true)throw new Error("Writing VS Code configuration requires confirm=true."); return vscodeConfig(a);
-    case "devcontainer.logs": {
-      const ps = await command("docker",["ps","-a","--filter","label=devcontainer.local_folder="+root,"--format","{{.ID}}"]);
-      if (ps.exitCode !== 0) throw new Error(ps.stderr || "Docker CLI unavailable.");
-      const id = String(a.containerId ?? ps.stdout.trim().split("\n").filter(Boolean)[0] ?? "");
-      if (!id || !/^[a-f0-9]{6,64}$/i.test(id)) return {found:false,containers:ps.stdout.trim().split("\n").filter(Boolean)};
-      return command("docker",["logs","--tail",String(Math.min(Math.max(Number(a.tail??200),1),2000)),...(a.since?["--since",String(a.since)]:[]),id],30000);
+    case "devcontainer.logs":
+    case "devcontainer.list_containers": {
+      const socketAvailable = await fs.access("/var/run/docker.sock").then(()=>true).catch(()=>false);
+      const docker = await command("docker",["--version"]);
+      return {available:false,operation,hostDockerCli:docker.available,hostDockerSocket:socketAvailable,reason:"The Codespaces agent runs inside the development container. Docker CLI/socket access belongs to the Codespaces host and is not mounted into this container. Use the Codespaces creation log or Rebuild Container action for host-container diagnostics."};
     }
-    case "devcontainer.list_containers": return command("docker",["ps","-a","--filter","label=devcontainer.local_folder="+root,"--format","{{json .}}"]);
     default: return undefined;
   }
 }
