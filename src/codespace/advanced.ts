@@ -109,7 +109,7 @@ async function vscodeConfig(a: any) {
   const dir = safePath(".vscode");
   const file = safePath(path.join(".vscode",a.name));
   if (a.action === "read") {
-    try { return { path:path.relative(root,file), content:await fs.readFile(file,"utf8") }; }
+    try { return { path:path.relative(root,file), text:await fs.readFile(file,"utf8") }; }
     catch (error:any) { if (error?.code === "ENOENT") return { path:path.relative(root,file), found:false }; throw error; }
   }
   if (a.action !== "write" || typeof a.content !== "string") throw new Error("action must be read or write; write requires content.");
