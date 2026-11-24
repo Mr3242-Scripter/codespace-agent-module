@@ -8,7 +8,7 @@ const bin = path.join(root, "node_modules", ".bin");
 const requiredBins = [
   "devcontainer",
   "bash-language-server",
-  "pyright",
+  "pyright-langserver",
   "typescript-language-server",
   "vscode-json-language-server",
   "vscode-html-language-server",
