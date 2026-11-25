@@ -73,6 +73,7 @@ Required system executables: Python 3, pip, Git, Docker CLI, GitHub CLI (`gh`), 
 - Archive extraction snapshots the source before validation and extracts that same snapshot, rejecting source changes, symlinks, compressed archives over 512 MiB, links, special files, absolute/traversal paths, archives over 10,000 entries, files over 128 MiB, and total uncompressed content over 512 MiB. Extraction uses a fresh staging directory and requires an empty destination.
 - Resumable uploads are limited to 256 MiB per transfer and 512 MiB reserved across all active transfers (20 sessions maximum).
 - Process signalling is restricted to PIDs belonging to sessions started and tracked by this agent.
+- Workspace task discovery reads the root Makefile as bounded text and parses target declarations statically; it never invokes the make executable or evaluates Makefile functions while listing tasks.
 - Relay requests have a 30-second timeout; JSON relay responses are capped at 1 MiB and outbound job results at 900 KiB.
 - The agent authentication token is removed from every child-process environment, including terminal, process, LSP, DAP, task, and helper commands.
 - `fs.read` and legacy `transfer.read` are limited to 512 KiB; larger files must use chunked downloads. Directory listings are limited to 1,000 entries. Filesystem search scans at most 1,000 files / 16 MiB across 5,000 entries and skips individual files larger than 1 MiB.

@@ -6,7 +6,7 @@ import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, isExpired, linkFileNoReplace, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
@@ -398,9 +398,18 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
     case "workspace.tasks.list": {
       let pkg:any=null;
       try{pkg=JSON.parse(await readWorkspaceTextBounded(safePath("package.json"),1024*1024));}catch(error:any){if(error?.code!=="ENOENT")throw error;}
-      const make=await command("make",["-qp"]);
-      const targets=[...make.stdout.matchAll(/^([A-Za-z0-9_.-]+):(?!=)/gm)].map(m=>m[1]).filter(x=>!x.startsWith("."));
-      return {packageManager:(await fs.readdir(root)).includes("pnpm-lock.yaml")?"pnpm":(await fs.readdir(root)).includes("yarn.lock")?"yarn":"npm",scripts:pkg?.scripts??{},makeTargets:[...new Set(targets)].slice(0,300)};
+      let makeTargets: string[] = [];
+      for (const candidate of ["GNUmakefile", "makefile", "Makefile"]) {
+        try {
+          const source = await readWorkspaceTextBounded(safePath(candidate), 1024 * 1024);
+          makeTargets = parseMakeTargets(source);
+          break;
+        } catch (error: any) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
+      const rootEntries = await fs.readdir(root);
+      return {packageManager:rootEntries.includes("pnpm-lock.yaml")?"pnpm":rootEntries.includes("yarn.lock")?"yarn":"npm",scripts:pkg?.scripts??{},makeTargets};
     }
     case "workspace.run_task": if(a.confirm!==true)throw new Error("Running a workspace task requires confirm=true."); return runTask(String(a.task),Array.isArray(a.args)?a.args.map(String):[],Number(a.timeoutMs??120000));
     case "workspace.run_tests": if(a.confirm!==true)throw new Error("Running tests requires confirm=true."); return runTask("test",Array.isArray(a.args)?a.args.map(String):[],Number(a.timeoutMs??300000));

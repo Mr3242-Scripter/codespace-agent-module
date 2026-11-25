@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -205,4 +205,19 @@ test("bounded file snapshots reject symlinks and oversized sources and preserve 
     await assert.rejects(createBoundedFileSnapshot(link, 1024));
     await assert.rejects(createBoundedFileSnapshot(source, 4), /input limit/i);
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
+
+
+test("Makefile task discovery is static and never evaluates shell expansions", () => {
+  const source = [
+    "# $(shell touch /tmp/should-never-run)",
+    "all: build test",
+    "build test: ; @echo $(shell touch /tmp/should-never-run)",
+    "VAR := $(shell touch /tmp/should-never-run)",
+    ".PHONY: all build test",
+    "\tignored-recipe: target",
+    "deploy\\",
+    "  release: dependency"
+  ].join("\n");
+  assert.deepEqual(parseMakeTargets(source), ["all", "build", "test", "deploy", "release"]);
 });

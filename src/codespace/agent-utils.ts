@@ -65,6 +65,25 @@ export function assertUploadCapacity<T extends { expectedSize: number }>(session
   if (reserved + expectedSize > maxAggregateBytes) throw new Error(`Aggregate active upload reservation limit reached (${Math.floor(maxAggregateBytes / 1024 / 1024)} MiB). Commit or abort another upload before starting this one.`);
 }
 
+export function parseMakeTargets(makefile: string): string[] {
+  const logicalLines = makefile.replace(/\\\r?\n[ \t]*/g, " ").split(/\r?\n/);
+  const targets = new Set<string>();
+  for (const line of logicalLines) {
+    // Recipe lines and comments are data, never evaluated.
+    if (/^[ \t]/.test(line) || /^\s*#/.test(line)) continue;
+    const colon = line.indexOf(":");
+    if (colon <= 0 || /^[=:]/.test(line.slice(colon + 1))) continue;
+    const lhs = line.slice(0, colon).trim();
+    if (!lhs || lhs.startsWith(".") || /[$%]/.test(lhs)) continue;
+    for (const target of lhs.split(/\s+/)) {
+      if (/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(target) && !target.startsWith(".")) {
+        targets.add(target);
+      }
+    }
+  }
+  return [...targets].slice(0, 300);
+}
+
 export function matchesFilenamePattern(value: string, pattern: string): boolean {
   const normalizedPattern = pattern.replace(/\\/g, "/");
   const normalizedValue = value.replace(/\\/g, "/");
