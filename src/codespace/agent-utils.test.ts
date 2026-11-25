@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -313,4 +313,32 @@ test("Makefile task discovery is static and never evaluates shell expansions", (
     "  release: dependency"
   ].join("\n");
   assert.deepEqual(parseMakeTargets(source), ["all", "build", "test", "deploy", "release"]);
+});
+
+test("Git remote operations disable hooks, external transports, ambient credentials, and SSH config commands", () => {
+  const safe = gitRemoteSafetyConfig();
+  for (const value of ["protocol.ext.allow=never", "core.hooksPath=/dev/null", "core.fsmonitor=false", "credential.helper=", "core.askPass=", "core.sshCommand=/usr/bin/ssh -F /dev/null"]) {
+    assert.ok(safe.some((arg, index) => index > 0 && safe[index - 1] === "-c" && arg === value), value);
+  }
+  assert.ok(!safe.some(value => value.includes("gh auth git-credential")));
+  const github = gitRemoteSafetyConfig("github.com");
+  assert.ok(github.includes("credential.https://github.com.helper=!gh auth git-credential"));
+  assert.ok(github.includes("credential.https://github.com.helper="));
+});
+
+test("Git branch arguments reject option and force-push refspec prefixes", () => {
+  assert.equal(validateGitBranchArgument("main"), "main");
+  assert.equal(validateGitBranchArgument("feature/security-fix"), "feature/security-fix");
+  assert.throws(() => validateGitBranchArgument("+refs/heads/main"), /Invalid Git branch/);
+  assert.throws(() => validateGitBranchArgument("-f"), /Invalid Git branch/);
+  assert.throws(() => validateGitBranchArgument("main:refs/heads/production"), /Invalid Git branch/);
+  assert.throws(() => validateGitBranchArgument("bad\nbranch"), /Invalid Git branch/);
+});
+
+test("Git tag arguments reject option-like names and control characters", () => {
+  assert.equal(validateGitTagArgument("v1.2.3"), "v1.2.3");
+  assert.equal(validateGitTagArgument("release/2026-11"), "release/2026-11");
+  assert.throws(() => validateGitTagArgument("--help"), /Invalid Git tag/);
+  assert.throws(() => validateGitTagArgument(""), /Invalid Git tag/);
+  assert.throws(() => validateGitTagArgument("bad\ntag"), /Invalid Git tag/);
 });

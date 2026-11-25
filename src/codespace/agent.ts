@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -75,6 +75,25 @@ async function resolveExecutable(command: string): Promise<string> {
   if (command.includes(path.sep)) return command;
   return resolveTrustedExecutable(command, systemEnv.PATH ?? "", root);
 }
+async function resolveGitObjectRef(refValue: unknown, cwd: string, objectType: "commit" | "object" = "commit"): Promise<string> {
+  const ref = String(refValue ?? "HEAD");
+  if (!ref || ref.length > 512 || /[\0\r\n]/.test(ref)) throw new Error("Invalid Git revision.");
+  const result = await run("git", ["rev-parse", "--verify", "--end-of-options", ref + "^{" + objectType + "}"], cwd, 15_000, systemEnv);
+  const oid = result.stdout.trim();
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(oid)) throw new Error("Git did not resolve the revision to a valid object ID.");
+  return oid;
+}
+async function validateGitBranchName(value: unknown, cwd: string): Promise<string> {
+  const branch = validateGitBranchArgument(value);
+  await run("git", ["check-ref-format", "refs/heads/" + branch], cwd, 15_000, systemEnv);
+  return branch;
+}
+async function validateGitTagName(value: unknown, cwd: string): Promise<string> {
+  const name = validateGitTagArgument(value);
+  await run("git", ["check-ref-format", "refs/tags/" + name], cwd, 15_000, systemEnv);
+  return name;
+}
+
 async function runGitRemoteOperation(operation: "fetch" | "pull" | "push", remoteValue: unknown, branchValue: unknown, cwd: string) {
   const remote = String(remoteValue ?? "origin");
   if (!remote || remote.startsWith("-") || remote.length > 2048 || /[\0\r\n]/.test(remote)) throw new Error("Invalid Git remote.");
@@ -86,15 +105,11 @@ async function runGitRemoteOperation(operation: "fetch" | "pull" | "push", remot
     const hosts = urls.map(value => getGitHubHttpsRemoteHost(value, process.env.GITHUB_SERVER_URL ?? "https://github.com"));
     if (hosts.length > 0 && hosts[0] && hosts.every(host => host === hosts[0])) githubHost = hosts[0];
   } catch {}
-  const args = ["-c", "protocol.ext.allow=never", "-c", "core.hooksPath=/dev/null"];
-  let env: NodeJS.ProcessEnv = systemEnv;
-  if (githubHost) {
-    const credentialKey = "credential.https://" + githubHost + ".helper";
-    args.push("-c", credentialKey + "=", "-c", credentialKey + "=!gh auth git-credential");
-    env = createGitHubCliEnv(process.env, root);
-  }
+  const branch = branchValue === undefined || branchValue === null || String(branchValue) === "" ? null : await validateGitBranchName(branchValue, cwd);
+  const args = gitRemoteSafetyConfig(githubHost);
+  const env: NodeJS.ProcessEnv = { ...(githubHost ? createGitHubCliEnv(process.env, root) : systemEnv), GIT_TERMINAL_PROMPT: "0" };
   args.push(operation, "--", remote);
-  if (branchValue !== undefined && branchValue !== null && String(branchValue) !== "") args.push(String(branchValue));
+  if (branch !== null) args.push(branch);
   return run("git", args, cwd, 120_000, env);
 }
 
@@ -328,9 +343,17 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     }
     case "git.status": return run("git", ["status", "--short", "--branch"], a.cwd ? resolvePath(a.cwd) : root);
     case "git.diff": return run("git", ["diff", ...(a.staged ? ["--cached"] : [])], a.cwd ? resolvePath(a.cwd) : root);
-    case "git.log": return run("git", ["log", "--oneline", "-n", String(a.limit ?? 20)], a.cwd ? resolvePath(a.cwd) : root);
+    case "git.log": {
+      const limit = Number(a.limit ?? 20);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("Git log limit must be an integer from 1 to 1000.");
+      return run("git", ["log", "--oneline", "-n", String(limit)], a.cwd ? resolvePath(a.cwd) : root);
+    }
     case "git.branch": return run("git", ["branch", "--show-current"], a.cwd ? resolvePath(a.cwd) : root);
-    case "git.checkout": return run("git", ["checkout", ...(a.create ? ["-b"] : []), String(a.branch)], a.cwd ? resolvePath(a.cwd) : root);
+    case "git.checkout": {
+      const cwd = a.cwd ? resolvePath(a.cwd) : root;
+      const branch = await validateGitBranchName(a.branch, cwd);
+      return run("git", ["-c", "core.hooksPath=/dev/null", "checkout", ...(a.create ? ["-b"] : []), branch], cwd);
+    }
     case "git.pull": return runGitRemoteOperation("pull", a.remote, a.branch, a.cwd ? resolvePath(a.cwd) : root);
     case "git.push": return runGitRemoteOperation("push", a.remote, a.branch, a.cwd ? resolvePath(a.cwd) : root);
     case "git.commit": {
@@ -350,9 +373,12 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     }
     case "git.reset": {
       const cwd = a.cwd ? resolvePath(a.cwd) : root;
-      const mode = a.mode ?? "mixed";
+      const mode = String(a.mode ?? "mixed");
+      if (!["soft", "mixed", "hard", "merge", "keep"].includes(mode)) throw new Error("Unsupported Git reset mode.");
       if (mode === "hard" && a.confirm !== true) throw new Error("Hard reset requires confirm=true.");
-      return run("git", ["reset", `--${mode}`, ...(a.ref ? [String(a.ref)] : [])], cwd, 120_000);
+      const args = ["reset", `--${mode}`];
+      if (a.ref !== undefined && a.ref !== null && String(a.ref) !== "") args.push(await resolveGitObjectRef(a.ref, cwd, "commit"));
+      return run("git", args, cwd, 120_000);
     }
     case "git.stash": {
       const cwd = a.cwd ? resolvePath(a.cwd) : root;
@@ -361,17 +387,28 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
         : action === "pop" ? ["stash", "pop"]
         : action === "drop" ? ["stash", "drop", ...(a.stashRef ? [String(a.stashRef)] : [])]
         : ["stash", "list"];
+      if (!["push", "pop", "drop", "list"].includes(action)) throw new Error("Unsupported Git stash action.");
+      if (action === "drop" && a.stashRef !== undefined && !/^stash@\{[0-9]+\}$/.test(String(a.stashRef))) throw new Error("stashRef must use the stash@{N} format.");
       if ((action === "drop" || action === "pop") && a.confirm !== true) throw new Error(`Git stash ${action} requires confirm=true.`);
       return run("git", args, cwd, 120_000);
     }
-    case "git.show": return run("git", ["show", "--stat", "--oneline", String(a.ref ?? "HEAD")], a.cwd ? resolvePath(a.cwd) : root);
+    case "git.show": {
+      const cwd = a.cwd ? resolvePath(a.cwd) : root;
+      const object = await resolveGitObjectRef(a.ref ?? "HEAD", cwd, "object");
+      return run("git", ["show", "--stat", "--oneline", object], cwd);
+    }
     case "git.remote": return run("git", ["remote", "-v"], a.cwd ? resolvePath(a.cwd) : root);
     case "git.tag": {
       const cwd = a.cwd ? resolvePath(a.cwd) : root;
-      if (a.action === "create") return run("git", ["tag", ...(a.message ? ["-a", String(a.name), "-m", String(a.message)] : [String(a.name)]), ...(a.ref ? [String(a.ref)] : [])], cwd);
+      if (a.action === "create") {
+        const name = await validateGitTagName(a.name, cwd);
+        const target = a.ref === undefined || a.ref === null || String(a.ref) === "" ? [] : [await resolveGitObjectRef(a.ref, cwd, "object")];
+        return run("git", ["tag", ...(a.message ? ["-a", name, "-m", String(a.message)] : [name]), ...target], cwd);
+      }
       if (a.action === "delete") {
         if (a.confirm !== true) throw new Error("Deleting a tag requires confirm=true.");
-        return run("git", ["tag", "-d", String(a.name)], cwd);
+        const name = await validateGitTagName(a.name, cwd);
+        return run("git", ["tag", "-d", name], cwd);
       }
       return run("git", ["tag", "--list"], cwd);
     }

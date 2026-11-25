@@ -154,6 +154,37 @@ export function getGitHubHttpsRemoteHost(remoteUrl: string, githubServerUrl = "h
   }
 }
 
+export function validateGitTagArgument(value: unknown): string {
+  const name = String(value ?? "");
+  if (!name || name.length > 255 || name.startsWith("-") || /[\0\r\n]/.test(name)) throw new Error("Invalid Git tag name.");
+  return name;
+}
+
+export function validateGitBranchArgument(value: unknown): string {
+  const branch = String(value ?? "");
+  // A leading plus is a force-push refspec modifier; a leading dash is an option.
+  if (!branch || branch.length > 255 || branch.startsWith("-") || branch.startsWith("+") || /[\0\r\n:]/.test(branch)) {
+    throw new Error("Invalid Git branch name.");
+  }
+  return branch;
+}
+
+export function gitRemoteSafetyConfig(githubHost: string | null = null): string[] {
+  const args = [
+    "-c", "protocol.ext.allow=never",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "credential.helper=",
+    "-c", "core.askPass=",
+    "-c", "core.sshCommand=/usr/bin/ssh -F /dev/null"
+  ];
+  if (githubHost) {
+    const helper = "credential.https://" + githubHost + ".helper";
+    args.push("-c", helper + "=", "-c", helper + "=!gh auth git-credential");
+  }
+  return args;
+}
+
 export function isLoopbackHost(value: string): boolean {
   const host=value.trim().replace(/^\[|\]$/g, "").toLowerCase();
   if(host==="localhost"||host==="::1")return true;

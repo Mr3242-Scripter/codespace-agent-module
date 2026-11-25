@@ -6,7 +6,7 @@ import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, resolveTrustedExecutable, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, gitRemoteSafetyConfig, validateGitBranchArgument, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, resolveTrustedExecutable, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
@@ -39,10 +39,10 @@ async function readWorkspaceFileBounded(file: string, maxBytes: number): Promise
 async function readWorkspaceTextBounded(file: string, maxBytes: number): Promise<string> {
   return (await readWorkspaceFileBounded(file, maxBytes)).toString("utf8");
 }
-async function command(bin: string, args: string[], timeout = 15000) {
+async function command(bin: string, args: string[], timeout = 15000, env: NodeJS.ProcessEnv = systemEnv) {
   try {
     const executable = await resolveTrustedExecutable(bin, systemEnv.PATH ?? "", root);
-    const result = await execFileAsync(executable, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: systemEnv });
+    const result = await execFileAsync(executable, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env });
     return { available: true, exitCode: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (error: any) {
     const missing = error?.code === "ENOENT";
@@ -287,12 +287,11 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       if(a.confirm!==true)throw new Error("Adding a Git worktree requires confirm=true.");
       const target=safePath(String(a.path));
       if(target===root)throw new Error("A worktree cannot replace the workspace root.");
-      const branch=String(a.branch??"");
-      if(!branch||branch.startsWith("-"))throw new Error("A valid branch name is required.");
-      const validBranch=await command("git",["check-ref-format","--branch",branch]);
+      const branch=validateGitBranchArgument(a.branch);
+      const validBranch=await command("git",["check-ref-format","refs/heads/"+branch]);
       if(validBranch.exitCode!==0)throw new Error("Git rejected the worktree branch name.");
       const args=["worktree","add",...(a.createBranch?["-b",branch]:[]),target,...(a.createBranch?[]:[branch])];
-      return command("git",args);
+      return command("git",["-c","core.hooksPath=/dev/null",...args]);
     }
     case "git.worktree.remove": {
       if(a.confirm!==true)throw new Error("Removing a Git worktree requires confirm=true.");
@@ -307,7 +306,8 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
     case "git.submodule.status": return command("git",["submodule","status","--recursive"]);
     case "git.submodule.update": {
       if(a.confirm!==true)throw new Error("Updating Git submodules requires confirm=true.");
-      return command("git",["submodule","update","--init",...(a.recursive?["--recursive"]:[])]);
+      const env = { ...systemEnv, GIT_TERMINAL_PROMPT: "0" };
+      return command("git",[...gitRemoteSafetyConfig(),"submodule","update","--init","--checkout",...(a.recursive?["--recursive"]:[])],120000,env);
     }
     case "workspace.watch.start": {
       if(watchSessions.size>=50)throw new Error("Workspace watch limit reached (50).");
