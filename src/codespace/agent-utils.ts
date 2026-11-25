@@ -162,7 +162,7 @@ export async function readFileBufferBounded(filePath: string, maxBytes: number):
 
 
 export async function createBoundedFileSnapshot(sourcePath: string, maxBytes: number): Promise<{ path: string; cleanup: () => Promise<void> }> {
-  const source = await fs.open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const source = await fs.open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   let directory: string | undefined;
   try {
     const before = await source.stat({ bigint: true });
