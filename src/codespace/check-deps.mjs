@@ -1,4 +1,5 @@
-import { access, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, readFile, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
@@ -44,9 +45,15 @@ for (const name of requiredPackages) {
 for (const name of requiredBins) {
   try { await access(path.join(root, "node_modules", ".bin", name), 1); }
   catch {
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync("bash", ["-lc", `command -v "${name}"`], { encoding: "utf8" });
-    if (result.status !== 0) missing.push(`required executable: ${name}`);
+    let found = false;
+    for (const directory of String(process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+      try {
+        const candidate = path.resolve(directory, name);
+        await access(candidate, constants.X_OK);
+        if ((await stat(candidate)).isFile()) { found = true; break; }
+      } catch {}
+    }
+    if (!found) missing.push(`required executable: ${name}`);
   }
 }
 try { require("node-pty"); }

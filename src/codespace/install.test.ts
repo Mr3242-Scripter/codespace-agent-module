@@ -7,7 +7,9 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createInstallerEnv } from "./install-utils.mjs";
 
-const installer = path.join(path.dirname(fileURLToPath(import.meta.url)), "install.mjs");
+const sourceDir = path.dirname(fileURLToPath(import.meta.url));
+const installer = path.join(sourceDir, "install.mjs");
+const dependencyCheck = path.join(sourceDir, "check-deps.mjs");
 
 test("portable installer installs into a clean target without following links", async () => {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-installer-"));
@@ -23,6 +25,29 @@ test("portable installer installs into a clean target without following links", 
     const devcontainer = JSON.parse(await fs.readFile(path.join(target, ".devcontainer", "devcontainer.json"), "utf8"));
     assert.match(devcontainer.postCreateCommand, /env -i HOME=/);
     assert.match(devcontainer.postCreateCommand, /npm install --userconfig=\/dev\/null && .*npm run codespace-agent:check --userconfig=\/dev\/null/);
+  } finally {
+    await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("dependency checker never invokes a login shell from PATH", async () => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-dependency-check-"));
+  const workspace = path.join(parent, "workspace");
+  const bin = path.join(parent, "bin");
+  const marker = path.join(parent, "shell-was-executed");
+  try {
+    await fs.mkdir(workspace);
+    await fs.mkdir(bin);
+    await fs.writeFile(path.join(workspace, "package.json"), JSON.stringify({ name: "fixture" }));
+    const fakeBash = path.join(bin, "bash");
+    await fs.writeFile(fakeBash, `#!/bin/sh\ntouch '${marker}'\nexit 0\n`);
+    await fs.chmod(fakeBash, 0o755);
+    const result = spawnSync(process.execPath, [dependencyCheck], {
+      encoding: "utf8",
+      env: { PATH: bin, HOME: workspace, CODESPACE_AGENT_WORKSPACE: workspace }
+    });
+    assert.notEqual(result.status, 0, "the incomplete fixture must fail dependency validation");
+    await assert.rejects(fs.access(marker), "dependency checking must not invoke PATH-provided shells");
   } finally {
     await fs.rm(parent, { recursive: true, force: true });
   }
