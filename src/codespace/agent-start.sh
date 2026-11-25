@@ -12,12 +12,22 @@ if [[ "${#CODESPACE_AGENT_TOKEN}" -lt 32 ]]; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$ROOT/../../package.json" ]]; then
+  WORKSPACE_ROOT="$(cd "$ROOT/../.." && pwd)"
+elif [[ -f "$ROOT/../package.json" ]]; then
+  WORKSPACE_ROOT="$(cd "$ROOT/.." && pwd)"
+else
+  WORKSPACE_ROOT="$(pwd)"
+fi
+CHECK_SCRIPT="${CODESPACE_AGENT_CHECK_SCRIPT:-check:agent}"
+
+npm run "$CHECK_SCRIPT" --prefix "$WORKSPACE_ROOT"
 if command -v tsx >/dev/null 2>&1; then
   exec tsx "$ROOT/agent-entry.ts"
 fi
-if [[ -x "$ROOT/../../node_modules/.bin/tsx" ]]; then
-  exec "$ROOT/../../node_modules/.bin/tsx" "$ROOT/agent-entry.ts"
+if [[ -x "$WORKSPACE_ROOT/node_modules/.bin/tsx" ]]; then
+  exec "$WORKSPACE_ROOT/node_modules/.bin/tsx" "$ROOT/agent-entry.ts"
 fi
 
-echo "tsx is required. Install it in the workspace (npm install --save-dev tsx) or add it to PATH." >&2
+echo "tsx is required. Install the mandatory Codespaces agent dependencies first." >&2
 exit 127

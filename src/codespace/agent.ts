@@ -8,37 +8,40 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
+import { matchesFilenamePattern, pruneEndedSessions } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
-// PTY support is required: fail startup rather than silently disabling terminal resizing.
+// PTY support is mandatory. Fail immediately if the native module is missing or cannot load.
 const ptyModule = localRequire("node-pty");
 const baseUrl = (process.env.CODESPACE_AGENT_URL ?? "").replace(/\/+$/, "");
 const token = process.env.CODESPACE_AGENT_TOKEN ?? "";
 const codespace = process.env.CODESPACE_NAME ?? "";
 const root = path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd());
 const rootReal = realpathSync(root);
-type Session = { child: any; output: string; ended: boolean; exitCode: number | null; command: string; createdAt: string; pty: boolean };
+type Session = { child: any; output: string; ended: boolean; endedAt: number | null; exitCode: number | null; command: string; createdAt: string; pty: boolean };
 const sessions = new Map<string, Session>();
 function startSession(command: string, cwd = root, usePty = false) {
-  if (sessions.size >= 50) throw new Error("Terminal/process session limit reached (50).");
+  pruneEndedSessions(sessions, Date.now(), 10 * 60_000, 100);
+  if ([...sessions.values()].filter(session => !session.ended).length >= 50) throw new Error("Terminal/process session limit reached (50 active sessions).");
   const safeCwd = resolvePath(cwd);
   const id = randomUUID();
-  const session: Session = { child: null, output: "", ended: false, exitCode: null, command, createdAt: new Date().toISOString(), pty: Boolean(usePty && ptyModule) };
+  const session: Session = { child: null, output: "", ended: false, endedAt: null, exitCode: null, command, createdAt: new Date().toISOString(), pty: Boolean(usePty) };
   const append = (chunk: string | Buffer) => { session.output = (session.output + chunk.toString()).slice(-100_000); };
   if (session.pty) {
     session.child = ptyModule.spawn("bash", ["-lc", command], {
       name: "xterm-256color", cols: 120, rows: 30, cwd: safeCwd, env: process.env
     });
     session.child.onData(append);
-    session.child.onExit((event: { exitCode: number }) => { session.ended = true; session.exitCode = event.exitCode; });
+    session.child.onExit((event: { exitCode: number }) => { session.ended = true; session.endedAt = Date.now(); session.exitCode = event.exitCode; });
   } else {
     session.child = spawn("bash", ["-lc", command], { cwd: safeCwd, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     session.child.stdout.on("data", append);
     session.child.stderr.on("data", append);
-    session.child.on("close", (code: number | null) => { session.ended = true; session.exitCode = code; });
+    session.child.on("close", (code: number | null) => { session.ended = true; session.endedAt = Date.now(); session.exitCode = code; });
   }
   sessions.set(id, session);
+  pruneEndedSessions(sessions, Date.now(), 10 * 60_000, 100);
   return { sessionId: id, pid: session.child.pid ?? null, pty: session.pty };
 }
 function signalChildTree(child: any, signal: NodeJS.Signals): boolean {
@@ -166,18 +169,19 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     }
     case "fs.find": {
       const matches: string[] = [], max = Math.min(Math.max(a.maxResults ?? 100, 1), 500);
-      const pattern = String(a.pattern).toLowerCase();
+      const pattern = String(a.pattern);
+      const searchRoot = resolvePath(a.path ?? ".");
       async function walk(dir: string): Promise<void> {
         if (matches.length >= max) return;
         for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
           if ([".git", "node_modules", ".venv"].includes(entry.name)) continue;
           const full = resolvePath(path.relative(root, path.join(dir, entry.name)));
-          if (entry.name.toLowerCase().includes(pattern)) matches.push(path.relative(root, full));
+          if (matchesFilenamePattern(path.relative(searchRoot, full), pattern)) matches.push(path.relative(root, full));
           if (entry.isDirectory()) await walk(full);
           if (matches.length >= max) break;
         }
       }
-      await walk(resolvePath(a.path ?? ".")); return matches;
+      await walk(searchRoot); return matches;
     }
     case "fs.chmod": {
       const mode = Number(a.mode);
@@ -260,7 +264,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "terminal.resize": {
       const session = sessions.get(String(a.sessionId));
       if (!session) throw new Error("Unknown terminal session.");
-      if (!session.pty || typeof session.child.resize !== "function") return { resized: false, available: false, reason: "This session was started without a pseudo-terminal. Install node-pty in the agent workspace and restart the agent to enable terminal resizing." };
+      if (!session.pty || typeof session.child.resize !== "function") return { resized: false, available: false, reason: "This is a non-terminal process session; resizing is available only for terminal sessions started with a pseudo-terminal." };
       const cols = Number(a.cols), rows = Number(a.rows);
       if (!Number.isInteger(cols) || cols < 20 || cols > 500 || !Number.isInteger(rows) || rows < 5 || rows > 200) throw new Error("Terminal size must be 20-500 columns and 5-200 rows.");
       session.child.resize(cols, rows);
@@ -320,7 +324,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
         : action === "pop" ? ["stash", "pop"]
         : action === "drop" ? ["stash", "drop", ...(a.stashRef ? [String(a.stashRef)] : [])]
         : ["stash", "list"];
-      if (action === "drop" && a.confirm !== true) throw new Error("Dropping a stash requires confirm=true.");
+      if ((action === "drop" || action === "pop") && a.confirm !== true) throw new Error(`Git stash ${action} requires confirm=true.`);
       return run("git", args, cwd, 120_000);
     }
     case "git.show": return run("git", ["show", "--stat", "--oneline", String(a.ref ?? "HEAD")], a.cwd ? resolvePath(a.cwd) : root);
@@ -335,16 +339,19 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       return run("git", ["tag", "--list"], cwd);
     }
     case "debug.start": {
+      pruneEndedSessions(debugSessions, Date.now(), 10 * 60_000, 50);
+      if ([...debugSessions.values()].filter(session => !session.ended).length >= 20) throw new Error("Debug-adapter session limit reached (20 active sessions).");
       const command = Array.isArray(a.command) ? a.command.map(String) : [];
       if (!command.length || command.length > 64 || command.some(part => part.length > 4096)) throw new Error("Debug adapter command must be a non-empty argv array.");
       const child = spawn(command[0], command.slice(1), { cwd: a.cwd ? resolvePath(a.cwd) : root, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
       const id = randomUUID();
-      const session: DebugSession = { child, buffer: Buffer.alloc(0), messages: [], stderr: "", ended: false, exitCode: null };
+      const session: DebugSession = { child, buffer: Buffer.alloc(0), messages: [], stderr: "", ended: false, endedAt: null, exitCode: null };
       child.stdout.on("data", (chunk: Buffer) => { try { session.buffer = Buffer.concat([session.buffer, chunk]); parseDebugMessages(session); } catch (error) { session.stderr = (session.stderr + (error instanceof Error ? error.message : String(error))).slice(-50_000); signalChildTree(child, "SIGTERM"); } });
       child.stderr.on("data", (chunk: Buffer) => { session.stderr = (session.stderr + chunk.toString("utf8")).slice(-50_000); });
-      child.on("close", (code: number | null) => { session.ended = true; session.exitCode = code; });
-      child.on("error", (error: Error) => { session.stderr = (session.stderr + error.message).slice(-50_000); session.ended = true; });
+      child.on("close", (code: number | null) => { session.ended = true; session.endedAt = Date.now(); session.exitCode = code; });
+      child.on("error", (error: Error) => { session.stderr = (session.stderr + error.message).slice(-50_000); session.ended = true; session.endedAt = Date.now(); });
       debugSessions.set(id, session);
+      pruneEndedSessions(debugSessions, Date.now(), 10 * 60_000, 50);
       return { sessionId: id, pid: child.pid ?? null, protocol: "Debug Adapter Protocol" };
     }
     case "debug.send": {
@@ -474,11 +481,14 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     }
     case "ports.inspect":
     case "ports.list": {
+      let forwardedPortsError: string | undefined;
       if (operation === "ports.list") {
         try {
           const forwarded = await run("gh", ["codespace", "ports", "--codespace", codespace, "--json", "sourcePort,visibility,browseUrl,label"], root, 15000);
           return { source: "gh-codespace-ports", forwardedPorts: JSON.parse(forwarded.stdout || "[]") };
-        } catch {}
+        } catch (error: any) {
+          forwardedPortsError = error?.message ?? String(error);
+        }
       }
       const listeners: Array<{ protocol: string; addressHex: string; port: number; state: string }> = [];
       for (const [file, protocol] of [["/proc/net/tcp", "tcp"], ["/proc/net/tcp6", "tcp6"]] as const) {
@@ -495,7 +505,17 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
         } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
       }
       if (listeners.length || await fs.access("/proc/net/tcp").then(()=>true).catch(()=>false)) {
-        return { source: "/proc/net/tcp", listeners, count: listeners.length, forwardedPortsAvailable: false, note: "Local listening sockets are shown. Install/authenticate GitHub CLI to retrieve forwarded-port metadata with gh codespace ports." };
+        return {
+          source: "/proc/net/tcp", listeners, count: listeners.length, forwardedPortsAvailable: false,
+          ...(forwardedPortsError ? { forwardedPortsError } : {}),
+          note: forwardedPortsError
+            ? (/executable not found on path:\\s*gh|spawn gh ENOENT|gh: command not found/i.test(forwardedPortsError)
+              ? "Local listeners are shown; GitHub CLI (gh) is not installed in the Codespace."
+              : /401|403|authentication|permission/i.test(forwardedPortsError)
+                ? "Local listeners are shown; GitHub CLI authentication or Codespaces permissions prevented forwarded-port metadata access."
+                : "Local listeners are shown; GitHub forwarded-port metadata could not be retrieved. See forwardedPortsError for the actual failure.")
+            : "Local listening sockets are shown. GitHub forwarded-port metadata is unavailable from this agent."
+        };
       }
       const args = ["-ltn"];
       if (a.port !== undefined) args.push("sport", "=", `:${Number(a.port)}`);
@@ -511,7 +531,14 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
         const result = await run("gh", ["codespace", "ports", "visibility", `${port}:${visibility}`, "--codespace", codespace], root, 30000);
         return { updated: true, available: true, codespace, port, visibility, ...result };
       } catch (error: any) {
-        return { updated: false, available: false, codespace, port, visibility, reason: error?.code === "ENOENT" ? "GitHub CLI (gh) is not installed in this Codespace." : error?.message ?? String(error), installHint: "Install the GitHub CLI or add the official github-cli Dev Container feature, then restart the agent." };
+        const detail = error?.message ?? String(error);
+        const missingCli = error?.code === "ENOENT" || /executable not found on path:\\s*gh|spawn gh ENOENT|gh: command not found/i.test(detail);
+        return {
+          updated: false, available: false, codespace, port, visibility,
+          reason: missingCli ? "GitHub CLI (gh) is not installed in this Codespace." : detail,
+          ...(missingCli ? { installHint: "Install the GitHub CLI or add the official github-cli Dev Container feature, then restart the agent." } : {}),
+          ...( /404|not found/i.test(detail) ? { hint: "Check that the Codespace and forwarded port exist and that the authenticated GitHub account can access them." } : {})
+        };
       }
     }
     case "ports.check": {
@@ -545,7 +572,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
   }
 }
 
-type DebugSession = { child: ReturnType<typeof spawn>; buffer: Buffer; messages: unknown[]; stderr: string; ended: boolean; exitCode: number | null };
+type DebugSession = { child: ReturnType<typeof spawn>; buffer: Buffer; messages: unknown[]; stderr: string; ended: boolean; endedAt: number | null; exitCode: number | null };
 const debugSessions = new Map<string, DebugSession>();
 function parseDebugMessages(session: DebugSession): void {
   while (true) {

@@ -1,2 +1,7 @@
 node_modules/
 *.log
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example

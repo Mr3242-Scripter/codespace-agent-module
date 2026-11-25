@@ -6,6 +6,7 @@ import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
+import { isExpired, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const root = path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd());
@@ -104,25 +105,41 @@ async function syncFiles(a: any) {
   if (direction === "manifest") return syncManifest();
   const entries = a.files;
   if (!Array.isArray(entries) || entries.length > 500) throw new Error("files must be an array containing at most 500 entries.");
-  let total = 0, completed = 0;
-  for (const entry of entries) {
-    const file = safePath(entry.path);
-    if (direction === "upload") {
-      const data = Buffer.from(String(entry.contentBase64 ?? ""),"base64");
+  if (direction === "upload") {
+    const staged: Array<{ path: string; data: Buffer }> = [];
+    const destinations = new Set<string>();
+    let total = 0;
+    for (const entry of entries) {
+      if (!entry || typeof entry.path !== "string" || !entry.path) throw new Error("Every upload entry requires a workspace-relative path.");
+      if (typeof entry.contentBase64 !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(entry.contentBase64)) {
+        throw new Error(`Invalid base64 content for upload path: ${entry.path}`);
+      }
+      const file = safePath(entry.path);
+      if (file === root) throw new Error("A batch upload cannot replace the workspace root.");
+      if (destinations.has(file)) throw new Error(`Duplicate upload destination: ${entry.path}`);
+      destinations.add(file);
+      const data = Buffer.from(entry.contentBase64, "base64");
+      if (data.toString("base64") !== entry.contentBase64) throw new Error(`Non-canonical base64 content for upload path: ${entry.path}`);
       total += data.length;
-      if (total > 1024*1024) throw new Error("Batch sync exceeds 1 MiB; use resumable chunked transfer for larger files.");
-      await fs.mkdir(path.dirname(file),{recursive:true});
-      await fs.writeFile(file,data);
-    } else if (direction === "download") {
-      const data = await fs.readFile(file);
-      total += data.length;
-      if (total > 1024*1024) throw new Error("Batch sync exceeds 1 MiB; use resumable chunked transfer for larger files.");
-      entry.contentBase64 = data.toString("base64");
-      entry.size = data.length;
-    } else throw new Error("direction must be manifest, upload, or download.");
-    completed++;
+      if (total > 1024 * 1024) throw new Error("Batch sync exceeds 1 MiB; use resumable chunked transfer for larger files.");
+      staged.push({ path: file, data });
+    }
+    await writeFilesAtomically(staged);
+    return { direction, completed: staged.length, bytes: total, files: entries.map((entry: any) => ({ path: entry.path, size: Buffer.from(entry.contentBase64, "base64").length })) };
   }
-  return { direction, completed, bytes:total, files:entries };
+  if (direction === "download") {
+    const downloaded: Array<{ path: string; contentBase64: string; size: number }> = [];
+    let total = 0;
+    for (const entry of entries) {
+      if (!entry || typeof entry.path !== "string" || !entry.path) throw new Error("Every download entry requires a workspace-relative path.");
+      const data = await fs.readFile(safePath(entry.path));
+      total += data.length;
+      if (total > 1024 * 1024) throw new Error("Batch sync exceeds 1 MiB; use resumable chunked transfer for larger files.");
+      downloaded.push({ path: entry.path, contentBase64: data.toString("base64"), size: data.length });
+    }
+    return { direction, completed: downloaded.length, bytes: total, files: downloaded };
+  }
+  throw new Error("direction must be manifest, upload, or download.");
 }
 async function vscodeConfig(a: any) {
   const allowed = new Set(["settings.json","tasks.json","launch.json","extensions.json"]);
@@ -143,10 +160,23 @@ async function vscodeConfig(a: any) {
 
 type WatchSession = { watcher: ReturnType<typeof watchFs>; events: Array<{event:string;filename:string|null;at:string}> };
 const watchSessions = new Map<string,WatchSession>();
-type TransferSession = { path:string; tempPath:string; expectedSize:number; received:number };
+type TransferSession = { path:string; tempPath:string; expectedSize:number; received:number; lastActivityAt:number };
 const uploadTransfers = new Map<string,TransferSession>();
+const UPLOAD_TTL_MS = 15 * 60_000;
+async function cleanupExpiredUploads(now = Date.now()): Promise<number> {
+  let removed = 0;
+  for (const [id, session] of uploadTransfers) {
+    if (!isExpired(session.lastActivityAt, now, UPLOAD_TTL_MS)) continue;
+    await fs.unlink(session.tempPath).catch(() => undefined);
+    uploadTransfers.delete(id);
+    removed++;
+  }
+  return removed;
+}
+const uploadCleanupTimer = setInterval(() => { void cleanupExpiredUploads(); }, 60_000);
+uploadCleanupTimer.unref?.();
 
-type LspSession = { child: ReturnType<typeof spawn>; buffer: Buffer; messages: unknown[]; stderr: string; ended: boolean; exitCode: number | null };
+type LspSession = { child: ReturnType<typeof spawn>; buffer: Buffer; messages: unknown[]; stderr: string; ended: boolean; endedAt: number | null; exitCode: number | null };
 const lspSessions = new Map<string,LspSession>();
 function parseLsp(session: LspSession) {
   while (true) {
@@ -269,7 +299,8 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       return {closed:true};
     }
     case "transfer.upload.begin": {
-      if(uploadTransfers.size>=20)throw new Error("Upload session limit reached (20).");
+      await cleanupExpiredUploads();
+      if(uploadTransfers.size>=20)throw new Error("Upload session limit reached (20 active uploads); expired sessions are cleaned automatically.");
       if(a.confirm!==true)throw new Error("Starting an upload requires confirm=true.");
       const target=safePath(String(a.path));
       if(target===root)throw new Error("Cannot upload over the workspace root.");
@@ -279,10 +310,11 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       await fs.mkdir(path.dirname(target),{recursive:true});
       const id=randomUUID(), tempPath=path.join(path.dirname(target),`.${path.basename(target)}.codespace-${id}.upload`);
       await fs.writeFile(tempPath,Buffer.alloc(0),{flag:"wx"});
-      uploadTransfers.set(id,{path:target,tempPath,expectedSize,received:0});
+      uploadTransfers.set(id,{path:target,tempPath,expectedSize,received:0,lastActivityAt:Date.now()});
       return {sessionId:id,path:path.relative(root,target),expectedSize,chunkBytes:256*1024};
     }
     case "transfer.upload.chunk": {
+      await cleanupExpiredUploads();
       const session=uploadTransfers.get(String(a.sessionId));
       if(!session)throw new Error("Unknown upload session.");
       const offset=Number(a.offset), data=Buffer.from(String(a.contentBase64??""),"base64");
@@ -291,9 +323,11 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       if(session.received+data.length>session.expectedSize)throw new Error("Chunk exceeds declared upload size.");
       await fs.appendFile(session.tempPath,data);
       session.received+=data.length;
+      session.lastActivityAt=Date.now();
       return {received:session.received,expectedSize:session.expectedSize,complete:session.received===session.expectedSize};
     }
     case "transfer.upload.commit": {
+      await cleanupExpiredUploads();
       const id=String(a.sessionId),session=uploadTransfers.get(id);
       if(!session)throw new Error("Unknown upload session.");
       if(session.received!==session.expectedSize)throw new Error(`Upload incomplete: received ${session.received} of ${session.expectedSize} bytes.`);
@@ -302,6 +336,7 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       return {committed:true,path:path.relative(root,session.path),bytes:session.received};
     }
     case "transfer.upload.abort": {
+      await cleanupExpiredUploads();
       if(a.confirm!==true)throw new Error("Aborting an upload requires confirm=true.");
       const id=String(a.sessionId),session=uploadTransfers.get(id);
       if(!session)return {aborted:false,alreadyClosed:true};
@@ -338,16 +373,19 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       return Promise.all(names.map(async name=>({name,available:(await command("which",[name],3000)).exitCode===0})));
     }
     case "lsp.start": {
+      pruneEndedSessions(lspSessions, Date.now(), 10 * 60_000, 50);
+      if ([...lspSessions.values()].filter(session => !session.ended).length >= 20) throw new Error("Language-server session limit reached (20 active sessions).");
       const argv=Array.isArray(a.command)?a.command.map(String):[];
       if(!argv.length||argv.length>64||argv.some(x=>x.length>4096))throw new Error("LSP command must be a non-empty argv array.");
       const child=spawn(argv[0],argv.slice(1),{cwd:safePath(a.cwd??"."),env:process.env,stdio:["pipe","pipe","pipe"]});
       const id=randomUUID();
-      const session:LspSession={child,buffer:Buffer.alloc(0),messages:[],stderr:"",ended:false,exitCode:null};
+      const session:LspSession={child,buffer:Buffer.alloc(0),messages:[],stderr:"",ended:false,endedAt:null,exitCode:null};
       child.stdout.on("data",(chunk:Buffer)=>{try{session.buffer=Buffer.concat([session.buffer,chunk]);parseLsp(session);}catch(error){session.stderr=(session.stderr+String(error)).slice(-50000);child.kill("SIGTERM");}});
       child.stderr.on("data",(chunk:Buffer)=>{session.stderr=(session.stderr+chunk.toString("utf8")).slice(-50000);});
-      child.on("close",(code:number|null)=>{session.ended=true;session.exitCode=code;});
-      child.on("error",(error:Error)=>{session.stderr=(session.stderr+error.message).slice(-50000);session.ended=true;});
+      child.on("close",(code:number|null)=>{session.ended=true;session.endedAt=Date.now();session.exitCode=code;});
+      child.on("error",(error:Error)=>{session.stderr=(session.stderr+error.message).slice(-50000);session.ended=true;session.endedAt=Date.now();});
       lspSessions.set(id,session);
+      pruneEndedSessions(lspSessions, Date.now(), 10 * 60_000, 50);
       return {sessionId:id,pid:child.pid??null,protocol:"Language Server Protocol / JSON-RPC"};
     }
     case "lsp.send": {

@@ -1,7 +1,7 @@
 {
   "name": "Codespaces Agent Playground",
   "image": "mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm",
-  "postCreateCommand": "npm install && npm run agent:check-deps",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y python3-pip && npm ci && npm run check:agent",
   "postStartCommand": "bash src/codespace/agent-service.sh start",
   "postAttachCommand": "bash src/codespace/agent-service.sh start",
   "features": {

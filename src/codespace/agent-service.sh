@@ -2,7 +2,14 @@
 set -euo pipefail
 ACTION="${1:-status}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "$ROOT/../.." && pwd)"
+if [[ -f "$ROOT/../../package.json" ]]; then
+  WORKSPACE_ROOT="$(cd "$ROOT/../.." && pwd)"
+elif [[ -f "$ROOT/../package.json" ]]; then
+  WORKSPACE_ROOT="$(cd "$ROOT/.." && pwd)"
+else
+  WORKSPACE_ROOT="$(cd "$ROOT/../.." && pwd)"
+fi
+CHECK_SCRIPT="${CODESPACE_AGENT_CHECK_SCRIPT:-check:agent}"
 export PATH="$WORKSPACE_ROOT/node_modules/.bin:$PATH"
 PID_FILE="${CODESPACE_AGENT_PID_FILE:-$HOME/.codespace-agent.pid}"
 LOG_FILE="${CODESPACE_AGENT_LOG_FILE:-$HOME/.codespace-agent.log}"
@@ -21,6 +28,10 @@ start_agent() {
   mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$PID_FILE")"
   if pid="$(agent_pid)"; then log "Codespaces agent already running (PID $pid)."; return 0; fi
   rm -f "$PID_FILE"
+  if [[ ! -f "$WORKSPACE_ROOT/node_modules/@types/node/index.d.ts" ]]; then
+    log "Cannot start agent; required dependency @types/node is missing. Run npm ci from the workspace root."
+    return 127
+  fi
   local missing=()
   for required in CODESPACE_AGENT_URL CODESPACE_AGENT_TOKEN CODESPACE_NAME; do
     if [[ -z "${!required:-}" ]]; then missing+=("$required"); fi
@@ -30,7 +41,14 @@ start_agent() {
   local tsx
   if command -v tsx >/dev/null 2>&1; then tsx="$(command -v tsx)"
   elif [[ -x "$ROOT/../../node_modules/.bin/tsx" ]]; then tsx="$ROOT/../../node_modules/.bin/tsx"
-  else log "Cannot start agent; tsx executable was not found. Run npm install in the workspace."; return 127; fi
+  else log "Cannot start agent; tsx executable was not found. Run npm ci in the workspace."; return 127; fi
+
+  log "Running mandatory dependency, typecheck, and regression-test checks."
+  if ! npm run "$CHECK_SCRIPT" --prefix "$WORKSPACE_ROOT"; then
+    log "Agent startup blocked because mandatory verification failed."
+    return 1
+  fi
+
   log "Starting Codespaces agent for ${CODESPACE_NAME}."
   nohup "$tsx" "$ROOT/agent-entry.ts" >>"$LOG_FILE" 2>&1 </dev/null &
   local pid=$!

@@ -1,0 +1,51 @@
+{
+  "name": "github-codespaces-agent",
+  "version": "1.0.0",
+  "description": "Portable Codespaces-side agent runtime with mandatory PTY support, lifecycle manager, diagnostics, and regression tests.",
+  "runtime": "node >=22",
+  "install": {
+    "destination": ".codespace-agent",
+    "requiredEnvironment": [
+      "CODESPACE_AGENT_URL",
+      "CODESPACE_AGENT_TOKEN",
+      "CODESPACE_NAME"
+    ],
+    "requiredPackages": {
+      "@devcontainers/cli": "^0.80.0",
+      "@types/node": "^22.20.5",
+      "bash-language-server": "^5.6.0",
+      "node-pty": "^1.1.0",
+      "pyright": "^1.1.408",
+      "tsx": "^4.20.3",
+      "typescript": "^5.9.3",
+      "typescript-language-server": "^5.1.3",
+      "vscode-langservers-extracted": "^4.10.0",
+      "yaml-language-server": "^1.19.0"
+    },
+    "requiredSystemExecutables": [
+      "python3", "pip3", "git", "docker", "gh", "code"
+    ],
+    "devcontainerFeatures": {
+      "ghcr.io/devcontainers/features/github-cli:1": {},
+      "ghcr.io/devcontainers/features/docker-in-docker:4": {}
+    }
+  },
+  "payload": [
+    "advanced.ts",
+    "agent-entry.ts",
+    "agent-service.sh",
+    "agent-start.sh",
+    "agent-utils.ts",
+    "agent-utils.test.ts",
+    "agent-service.test.ts",
+    "agent.ts",
+    "AGENT_INSTRUCTIONS.md",
+    "INSTALL.md",
+    "supervisor.ts",
+    "check-deps.mjs",
+    "tsconfig.json",
+    "package.json",
+    "README.md",
+    "module.json"
+  ]
+}
