@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitCommitSafetyConfig, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertTerminalInputCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitCommitSafetyConfig, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -15,6 +15,13 @@ test("filename matching supports glob wildcards and legacy substring searches", 
   assert.equal(matchesFilenamePattern("nested/report.txt", "port"), true);
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.lua"), false);
   assert.throws(() => matchesFilenamePattern("a".repeat(255), "*a*a*a*a*a*a*a*a*a"), /8-wildcard complexity limit/);
+});
+
+test("terminal input enforces per-message and queued-byte limits", () => {
+  assert.doesNotThrow(() => assertTerminalInputCapacity(256 * 1024, 0));
+  assert.throws(() => assertTerminalInputCapacity(256 * 1024 + 1, 0), /Terminal input/);
+  assert.throws(() => assertTerminalInputCapacity(128 * 1024, 1024 * 1024 - 128 * 1024 + 1), /Terminal input/);
+  assert.throws(() => assertTerminalInputCapacity(-1, 0), /Terminal input/);
 });
 
 test("completed sessions expire and old completed entries are evicted to enforce the cap", () => {

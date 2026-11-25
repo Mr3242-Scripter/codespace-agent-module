@@ -202,6 +202,13 @@ export function assertProtocolHeaderCapacity(headerBytes: number, maxBytes: numb
   }
 }
 
+export function assertTerminalInputCapacity(inputBytes: number, queuedBytes = 0, maxInputBytes = 256 * 1024, maxQueuedBytes = 1024 * 1024): void {
+  if (!Number.isSafeInteger(inputBytes) || !Number.isSafeInteger(queuedBytes) || inputBytes < 0 || queuedBytes < 0 ||
+      inputBytes > maxInputBytes || queuedBytes + inputBytes > maxQueuedBytes) {
+    throw new Error("Terminal input exceeds the per-message or queued-input limit.");
+  }
+}
+
 export function assertProtocolBufferCapacity(currentBytes: number, incomingBytes: number, maxBytes: number): void {
   if(!Number.isSafeInteger(currentBytes)||!Number.isSafeInteger(incomingBytes)||currentBytes<0||incomingBytes<0||currentBytes+incomingBytes>maxBytes)throw new Error("Protocol receive buffer limit exceeded.");
 }

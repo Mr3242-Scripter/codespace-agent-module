@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitCommitSafetyConfig, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
+import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertTerminalInputCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitCommitSafetyConfig, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -24,6 +24,7 @@ const systemEnv = { ...childEnv, PATH: filterTrustedExecutablePath(process.env.P
 type Session = { child: any; output: string; ended: boolean; endedAt: number | null; exitCode: number | null; command: string; createdAt: string; pty: boolean };
 const sessions = new Map<string, Session>();
 function startSession(command: string, cwd = root, usePty = false) {
+  if (command.length > 16 * 1024) throw new Error("Process command exceeds the 16 KiB limit.");
   pruneEndedSessions(sessions, Date.now(), 10 * 60_000, 100);
   if ([...sessions.values()].filter(session => !session.ended).length >= 50) throw new Error("Terminal/process session limit reached (50 active sessions).");
   const safeCwd = resolvePath(cwd);
@@ -298,12 +299,29 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       }
       await walk(resolvePath(a.path ?? ".")); return matches;
     }
-    case "terminal.exec": return run("bash", ["-lc", String(a.command)], a.cwd ? resolvePath(a.cwd) : root, a.timeoutMs, childEnv);
+    case "terminal.exec": {
+      const command = String(a.command ?? "");
+      if (!command || command.length > 16 * 1024) throw new Error("Terminal command must contain 1-16384 characters.");
+      return run("bash", ["-lc", command], a.cwd ? resolvePath(a.cwd) : root, a.timeoutMs, childEnv);
+    }
     case "terminal.start": return startSession(String(a.command), a.cwd ? resolvePath(a.cwd) : root, true);
     case "terminal.input": {
       const session = sessions.get(String(a.sessionId));
       if (!session || session.ended) throw new Error("Terminal session is not running.");
-      if (session.pty) session.child.write(String(a.input)); else session.child.stdin.write(String(a.input)); return { sent: true, pty: session.pty };
+      const input = String(a.input ?? "");
+      const inputBytes = Buffer.byteLength(input, "utf8");
+      const stdin = session.pty ? null : session.child.stdin;
+      assertTerminalInputCapacity(inputBytes, stdin?.writableLength ?? 0);
+      if (session.pty) session.child.write(input);
+      else if (!stdin.write(input)) await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { cleanup(); reject(new Error("Terminal input drain timed out.")); }, 10_000);
+        const cleanup = () => { clearTimeout(timer); stdin.off("drain", onDrain); stdin.off("error", onError); stdin.off("close", onClose); };
+        const onDrain = () => { cleanup(); resolve(); };
+        const onError = (error: Error) => { cleanup(); reject(error); };
+        const onClose = () => { cleanup(); reject(new Error("Terminal input closed before draining.")); };
+        stdin.once("drain", onDrain); stdin.once("error", onError); stdin.once("close", onClose);
+      });
+      return { sent: true, bytes: inputBytes, pty: session.pty };
     }
     case "terminal.read": return readSession(String(a.sessionId), Boolean(a.clear));
     case "terminal.close": {
