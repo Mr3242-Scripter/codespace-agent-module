@@ -141,6 +141,19 @@ export function requirePublicPortConfirmation(visibility: string, confirmed: boo
   if(visibility==="public"&&!confirmed)throw new Error("Making a forwarded port public requires confirm=true.");
 }
 
+export function getGitHubHttpsRemoteHost(remoteUrl: string, githubServerUrl = "https://github.com"): string | null {
+  try {
+    const remote = new URL(remoteUrl);
+    const server = new URL(githubServerUrl);
+    if (remote.protocol !== "https:" || server.protocol !== "https:" ||
+        remote.username || remote.password || remote.hostname !== server.hostname ||
+        remote.port !== server.port || remote.search || remote.hash || remote.pathname === "/") return null;
+    return remote.host;
+  } catch {
+    return null;
+  }
+}
+
 export function isLoopbackHost(value: string): boolean {
   const host=value.trim().replace(/^\[|\]$/g, "").toLowerCase();
   if(host==="localhost"||host==="::1")return true;

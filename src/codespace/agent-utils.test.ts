@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -82,6 +82,15 @@ test("batch upload rejects duplicate destinations before writing", async () => {
   }
 });
 
+
+test("GitHub credential scoping accepts only matching HTTPS remotes", () => {
+  assert.equal(getGitHubHttpsRemoteHost("https://github.com/Mr3242-Scripter/repo.git"), "github.com");
+  assert.equal(getGitHubHttpsRemoteHost("https://git.example.internal/team/repo.git", "https://git.example.internal"), "git.example.internal");
+  assert.equal(getGitHubHttpsRemoteHost("https://github.com.evil.example/team/repo.git"), null);
+  assert.equal(getGitHubHttpsRemoteHost("http://github.com/team/repo.git"), null);
+  assert.equal(getGitHubHttpsRemoteHost("https://user:secret@github.com/team/repo.git"), null);
+  assert.equal(getGitHubHttpsRemoteHost("git@github.com:team/repo.git"), null);
+});
 
 test("relay URLs require HTTPS except for loopback development", () => {
   assert.doesNotThrow(() => validateRelayUrl("https://relay.example.test"));

@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -75,6 +75,29 @@ async function resolveExecutable(command: string): Promise<string> {
   if (command.includes(path.sep)) return command;
   return resolveTrustedExecutable(command, systemEnv.PATH ?? "", root);
 }
+async function runGitRemoteOperation(operation: "fetch" | "pull" | "push", remoteValue: unknown, branchValue: unknown, cwd: string) {
+  const remote = String(remoteValue ?? "origin");
+  if (!remote || remote.startsWith("-") || remote.length > 2048 || /[\0\r\n]/.test(remote)) throw new Error("Invalid Git remote.");
+  let githubHost: string | null = null;
+  try {
+    const urlArgs = operation === "push" ? ["--push", "--all"] : ["--all"];
+    const remoteInfo = await run("git", ["remote", "get-url", ...urlArgs, remote], cwd, 15_000, systemEnv);
+    const urls = remoteInfo.stdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    const hosts = urls.map(value => getGitHubHttpsRemoteHost(value, process.env.GITHUB_SERVER_URL ?? "https://github.com"));
+    if (hosts.length > 0 && hosts[0] && hosts.every(host => host === hosts[0])) githubHost = hosts[0];
+  } catch {}
+  const args = ["-c", "protocol.ext.allow=never", "-c", "core.hooksPath=/dev/null"];
+  let env: NodeJS.ProcessEnv = systemEnv;
+  if (githubHost) {
+    const credentialKey = "credential.https://" + githubHost + ".helper";
+    args.push("-c", credentialKey + "=", "-c", credentialKey + "=!gh auth git-credential");
+    env = createGitHubCliEnv(process.env, root);
+  }
+  args.push(operation, "--", remote);
+  if (branchValue !== undefined && branchValue !== null && String(branchValue) !== "") args.push(String(branchValue));
+  return run("git", args, cwd, 120_000, env);
+}
+
 async function run(command: string, args: string[], cwd = root, timeout = 30_000, env: NodeJS.ProcessEnv = systemEnv) {
   const safeCwd = resolvePath(cwd);
   const executable = await resolveExecutable(command);
@@ -308,14 +331,14 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "git.log": return run("git", ["log", "--oneline", "-n", String(a.limit ?? 20)], a.cwd ? resolvePath(a.cwd) : root);
     case "git.branch": return run("git", ["branch", "--show-current"], a.cwd ? resolvePath(a.cwd) : root);
     case "git.checkout": return run("git", ["checkout", ...(a.create ? ["-b"] : []), String(a.branch)], a.cwd ? resolvePath(a.cwd) : root);
-    case "git.pull": return run("git", ["pull", a.remote ?? "origin", ...(a.branch ? [a.branch] : [])], a.cwd ? resolvePath(a.cwd) : root, 120_000);
-    case "git.push": return run("git", ["push", a.remote ?? "origin", ...(a.branch ? [a.branch] : [])], a.cwd ? resolvePath(a.cwd) : root, 120_000);
+    case "git.pull": return runGitRemoteOperation("pull", a.remote, a.branch, a.cwd ? resolvePath(a.cwd) : root);
+    case "git.push": return runGitRemoteOperation("push", a.remote, a.branch, a.cwd ? resolvePath(a.cwd) : root);
     case "git.commit": {
       const cwd = a.cwd ? resolvePath(a.cwd) : root;
       if (a.all) await run("git", ["add", "-A"], cwd);
       return run("git", ["commit", "-m", String(a.message)], cwd, 120_000);
     }
-    case "git.fetch": return run("git", ["fetch", a.remote ?? "origin"], a.cwd ? resolvePath(a.cwd) : root, 120_000);
+    case "git.fetch": return runGitRemoteOperation("fetch", a.remote, undefined, a.cwd ? resolvePath(a.cwd) : root);
     case "git.add": {
       const cwd = a.cwd ? resolvePath(a.cwd) : root;
       const paths = (a.paths ?? ["."]).map((p: string) => {
