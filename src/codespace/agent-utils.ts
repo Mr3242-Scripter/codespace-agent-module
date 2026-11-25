@@ -158,7 +158,19 @@ export function assertProtocolQueueCapacity(queuedBytes: number, messageBytes: n
 
 export function createChildProcessEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env = { ...source };
-  delete env.CODESPACE_AGENT_TOKEN;
+  for (const name of [
+    "CODESPACE_AGENT_TOKEN",
+    "GITHUB_TOKEN",
+    "GITHUB_CODESPACE_TOKEN",
+    "GH_TOKEN"
+  ]) delete env[name];
+  return env;
+}
+
+export function createGitHubCliEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = createChildProcessEnv(source);
+  const credential = source.GITHUB_TOKEN || source.GITHUB_CODESPACE_TOKEN || source.GH_TOKEN;
+  if (credential) env.GH_TOKEN = credential;
   return env;
 }
 

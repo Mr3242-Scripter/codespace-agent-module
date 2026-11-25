@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -169,13 +169,38 @@ test("public forwarded-port exposure requires explicit confirmation", () => {
 });
 
 
-test("child process environments never inherit the agent authentication token", () => {
-  const source = { PATH: "/usr/bin", CODESPACE_AGENT_TOKEN: "synthetic-secret", OTHER_TOKEN: "keep-me" };
+test("untrusted child process environments never inherit agent or GitHub credentials", () => {
+  const source = {
+    PATH: "/usr/bin",
+    CODESPACE_AGENT_TOKEN: "agent-secret",
+    GITHUB_TOKEN: "github-secret",
+    GITHUB_CODESPACE_TOKEN: "codespace-secret",
+    GH_TOKEN: "gh-secret",
+    OTHER_TOKEN: "unrelated-value"
+  };
   const child = createChildProcessEnv(source);
   assert.equal(child.PATH, "/usr/bin");
-  assert.equal(child.OTHER_TOKEN, "keep-me");
+  assert.equal(child.OTHER_TOKEN, "unrelated-value");
+  for (const name of ["CODESPACE_AGENT_TOKEN", "GITHUB_TOKEN", "GITHUB_CODESPACE_TOKEN", "GH_TOKEN"]) {
+    assert.equal(child[name as keyof typeof child], undefined);
+  }
+  assert.equal(source.GITHUB_TOKEN, "github-secret");
+});
+
+test("only trusted GitHub CLI environments receive a scoped GH_TOKEN", () => {
+  const source = {
+    PATH: "/usr/bin",
+    CODESPACE_AGENT_TOKEN: "agent-secret",
+    GITHUB_TOKEN: "github-secret",
+    GITHUB_CODESPACE_TOKEN: "codespace-secret",
+    GH_TOKEN: "gh-secret"
+  };
+  const child = createGitHubCliEnv(source);
+  assert.equal(child.GH_TOKEN, "github-secret");
+  assert.equal(child.GITHUB_TOKEN, undefined);
+  assert.equal(child.GITHUB_CODESPACE_TOKEN, undefined);
   assert.equal(child.CODESPACE_AGENT_TOKEN, undefined);
-  assert.equal(source.CODESPACE_AGENT_TOKEN, "synthetic-secret");
+  assert.equal(source.GITHUB_TOKEN, "github-secret");
 });
 
 test("bounded file reads preserve small files and reject oversized files", async () => {

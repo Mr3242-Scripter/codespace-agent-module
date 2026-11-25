@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -79,13 +79,13 @@ async function resolveExecutable(command: string): Promise<string> {
   }
   throw new Error(`Executable not found on PATH: ${command}`);
 }
-async function run(command: string, args: string[], cwd = root, timeout = 30_000) {
+async function run(command: string, args: string[], cwd = root, timeout = 30_000, env: NodeJS.ProcessEnv = childEnv) {
   const safeCwd = resolvePath(cwd);
   const executable = await resolveExecutable(command);
   const timeoutMs = Math.min(Math.max(timeout, 1000), 120_000);
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(executable, args, {
-      cwd: safeCwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"],
+      cwd: safeCwd, env, stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32", windowsHide: true
     });
     let stdout = "", stderr = "", totalBytes = 0, timedOut = false, overflow = false, settled = false;
@@ -489,7 +489,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       if (a.confirm !== true) throw new Error("Rebuilding a Codespace requires confirm=true.");
       try {
         const args = ["codespace", "rebuild", "--codespace", codespace, ...(a.removeExistingContainer ? ["--full"] : [])];
-        const result = await run("gh", args, root, 120_000);
+        const result = await run("gh", args, root, 120_000, createGitHubCliEnv());
         return { requested: true, operation: "codespace-rebuild", ...result, note: "The Codespace may disconnect while GitHub rebuilds its container. The agent should reconnect through the configured postStartCommand." };
       } catch (error: any) {
         return { requested: false, available: false, reason: error?.message ?? String(error), fallback: "Run 'Codespaces: Rebuild Container' from the GitHub Codespaces Command Palette." };
@@ -510,7 +510,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       let forwardedPortsError: string | undefined;
       if (operation === "ports.list") {
         try {
-          const forwarded = await run("gh", ["codespace", "ports", "--codespace", codespace, "--json", "sourcePort,visibility,browseUrl,label"], root, 15000);
+          const forwarded = await run("gh", ["codespace", "ports", "--codespace", codespace, "--json", "sourcePort,visibility,browseUrl,label"], root, 15000, createGitHubCliEnv());
           return { source: "gh-codespace-ports", forwardedPorts: JSON.parse(forwarded.stdout || "[]") };
         } catch (error: any) {
           forwardedPortsError = error?.message ?? String(error);
@@ -555,7 +555,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       if (!["private", "org", "public"].includes(visibility)) throw new Error("visibility must be private, org, or public.");
       requirePublicPortConfirmation(visibility,a.confirm===true);
       try {
-        const result = await run("gh", ["codespace", "ports", "visibility", `${port}:${visibility}`, "--codespace", codespace], root, 30000);
+        const result = await run("gh", ["codespace", "ports", "visibility", `${port}:${visibility}`, "--codespace", codespace], root, 30000, createGitHubCliEnv());
         return { updated: true, available: true, codespace, port, visibility, ...result };
       } catch (error: any) {
         const detail = error?.message ?? String(error);
