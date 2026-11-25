@@ -73,8 +73,16 @@ Required system executables: Python 3, pip, Git, Docker CLI, GitHub CLI (`gh`), 
 - Archive extraction rejects links, special files, absolute/traversal paths, archives over 10,000 entries, files over 128 MiB, and total uncompressed content over 512 MiB. Extraction uses a fresh staging directory and requires an empty destination.
 - Resumable uploads are limited to 256 MiB per transfer and 512 MiB reserved across all active transfers (20 sessions maximum).
 - Process signalling is restricted to PIDs belonging to sessions started and tracked by this agent.
-- Relay requests have a 30-second timeout; JSON relay responses are capped at 1 MiB.
-- Workspace path validation rejects symlink components, including symlinks that resolve back inside the workspace. Avoid allowing untrusted concurrent processes to mutate workspace directory entries while the agent is operating; Node's path-based filesystem APIs cannot provide a complete `openat2`-style race-free guarantee across every operation.
+- Relay requests have a 30-second timeout; JSON relay responses are capped at 1 MiB and outbound job results at 900 KiB.
+- The agent authentication token is removed from every child-process environment, including terminal, process, LSP, DAP, task, and helper commands.
+- `fs.read` and legacy `transfer.read` are limited to 512 KiB; larger files must use chunked downloads. Directory listings are limited to 1,000 entries. Filesystem search scans at most 1,000 files / 16 MiB across 5,000 entries and skips individual files larger than 1 MiB.
+- LSP and DAP queues are limited to 8 MiB of accounted message storage and 4,096 messages; each queued message accounts for at least 256 bytes of overhead.
+- Workspace path validation rejects symlink components, including symlinks that resolve back inside the workspace. Directory listing and stat operations use `lstat` so symlink metadata is not followed. Path-based filesystem operations still cannot provide a complete `openat2`-style race-free guarantee if an untrusted process concurrently replaces parent directories; isolate the agent from untrusted concurrent workspace writers.
+- LSP and DAP transports cap message headers, receive buffers, queued message bytes, and pending input writes; sessions exceeding those limits are terminated or rejected.
+- Forwarded-port checks are restricted to localhost and loopback IP addresses. Changing a forwarded port to `public` requires explicit `confirm: true`.
+- Resumable uploads without overwrite permission use an atomic same-filesystem no-replace link at commit time, preventing a destination created after upload start from being overwritten.
+- Process listing and inspection omit raw command-line arguments to reduce accidental disclosure of credentials passed through process arguments.
+- The portable installer rejects symlinked destination paths and uses exclusive payload copies and atomic configuration writes.
 
 ## Commands
 

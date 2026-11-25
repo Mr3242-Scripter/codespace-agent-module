@@ -8,7 +8,7 @@
     "agent:stop": "bash src/codespace/agent-service.sh stop",
     "agent:check-deps": "node scripts/check-agent-deps.mjs",
     "typecheck": "tsc --noEmit",
-    "test:agent": "tsx --test src/codespace/agent-utils.test.ts src/codespace/agent-service.test.ts",
+    "test:agent": "tsx --test src/codespace/agent-utils.test.ts src/codespace/agent-service.test.ts src/codespace/install.test.ts",
     "check:agent": "npm run agent:check-deps && npm run typecheck && npm run test:agent"
   },
   "devDependencies": {

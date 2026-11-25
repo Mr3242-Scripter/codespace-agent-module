@@ -115,6 +115,58 @@ export function isExpired(lastActivityAt: number, now = Date.now(), ttlMs = 15 *
   return now - lastActivityAt >= ttlMs;
 }
 
+export function requirePublicPortConfirmation(visibility: string, confirmed: boolean): void {
+  if(visibility==="public"&&!confirmed)throw new Error("Making a forwarded port public requires confirm=true.");
+}
+
+export function isLoopbackHost(value: string): boolean {
+  const host=value.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  if(host==="localhost"||host==="::1")return true;
+  const octets=host.split(".");
+  return octets.length===4 && octets.every(part=>/^\d{1,3}$/.test(part)&&Number(part)>=0&&Number(part)<=255) && Number(octets[0])===127;
+}
+
+export function assertProtocolBufferCapacity(currentBytes: number, incomingBytes: number, maxBytes: number): void {
+  if(!Number.isSafeInteger(currentBytes)||!Number.isSafeInteger(incomingBytes)||currentBytes<0||incomingBytes<0||currentBytes+incomingBytes>maxBytes)throw new Error("Protocol receive buffer limit exceeded.");
+}
+
+export function assertProtocolQueueCapacity(queuedBytes: number, messageBytes: number, maxBytes: number, queuedMessages = 0, maxMessages = 4096): void {
+  if (!Number.isSafeInteger(messageBytes) || messageBytes < 0) throw new Error("Invalid protocol message size.");
+  const charge = Math.max(messageBytes, 256);
+  if (!Number.isSafeInteger(queuedBytes) || !Number.isSafeInteger(queuedMessages) || queuedBytes < 0 || queuedMessages < 0 || queuedMessages + 1 > maxMessages || queuedBytes + charge > maxBytes) throw new Error("Protocol queued-message limit exceeded.");
+}
+
+export function createChildProcessEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...source };
+  delete env.CODESPACE_AGENT_TOKEN;
+  return env;
+}
+
+export async function readFileBufferBounded(filePath: string, maxBytes: number): Promise<Buffer> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("Target must be a regular file.");
+    if (stat.size > maxBytes) throw new Error("File exceeds the " + Math.floor(maxBytes / 1024) + " KiB read limit; use chunked transfer.download.chunk instead.");
+    const buffer = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const result = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (!result.bytesRead) break;
+      offset += result.bytesRead;
+    }
+    return buffer.subarray(0, offset);
+  } finally { await handle.close(); }
+}
+
+export async function readFileBounded(filePath: string, maxBytes: number): Promise<string> {
+  return (await readFileBufferBounded(filePath, maxBytes)).toString("utf8");
+}
+export async function linkFileNoReplace(tempPath: string, targetPath: string): Promise<void> {
+  await fs.link(tempPath,targetPath);
+  await fs.unlink(tempPath);
+}
+
 export async function writeFilesAtomically(files: Array<{ path: string; data: Buffer }>): Promise<number> {
   const seen = new Set<string>();
   const staged: Array<{ target: string; temp: string; backup: string; backupMoved: boolean; installed: boolean }> = [];

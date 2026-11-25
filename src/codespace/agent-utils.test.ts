@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertUploadCapacity, inspectArchiveListing, isExpired, matchesFilenamePattern, pruneEndedSessions, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -132,4 +132,59 @@ test("process signalling can resolve only a live PID owned by a tracked agent se
   const sessions = new Map([["owned", owned]]);
   assert.equal(requireTrackedSession(sessions, 4242), owned);
   assert.throws(() => requireTrackedSession(sessions, 4343), /tracked by this agent/i);
+});
+
+
+test("protocol receive buffers and queued messages enforce byte budgets", () => {
+  assert.doesNotThrow(() => assertProtocolBufferCapacity(10, 5, 15));
+  assert.throws(() => assertProtocolBufferCapacity(10, 6, 15), /buffer limit/i);
+  assert.doesNotThrow(() => assertProtocolQueueCapacity(0, 5, 256));
+  assert.throws(() => assertProtocolQueueCapacity(8000, 500, 8192), /queued-message limit/i);
+  assert.throws(() => assertProtocolQueueCapacity(0, 0, 8192, 4096, 4096), /queued-message limit/i);
+  assert.doesNotThrow(() => assertProtocolQueueCapacity(0, 0, 8192, 4095, 4096));
+});
+
+test("port-check host policy accepts only localhost and valid loopback addresses", () => {
+  for (const host of ["localhost", "127.0.0.1", "127.22.1.9", "::1", "[::1]"]) assert.equal(isLoopbackHost(host), true, host);
+  for (const host of ["example.com", "192.168.1.1", "10.0.0.1", "127.999.0.1", "0.0.0.0", "::"]) assert.equal(isLoopbackHost(host), false, host);
+});
+
+test("resumable upload commit helper never replaces an existing destination", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-no-replace-"));
+  try {
+    const temp = path.join(dir, "upload.tmp"), target = path.join(dir, "target.txt");
+    await fs.writeFile(temp, "new"); await fs.writeFile(target, "original");
+    await assert.rejects(linkFileNoReplace(temp, target), { code: "EEXIST" });
+    assert.equal(await fs.readFile(target, "utf8"), "original");
+    assert.equal(await fs.readFile(temp, "utf8"), "new");
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
+
+
+test("public forwarded-port exposure requires explicit confirmation", () => {
+  assert.doesNotThrow(() => requirePublicPortConfirmation("private", false));
+  assert.doesNotThrow(() => requirePublicPortConfirmation("org", false));
+  assert.doesNotThrow(() => requirePublicPortConfirmation("public", true));
+  assert.throws(() => requirePublicPortConfirmation("public", false), /confirm=true/i);
+});
+
+
+test("child process environments never inherit the agent authentication token", () => {
+  const source = { PATH: "/usr/bin", CODESPACE_AGENT_TOKEN: "synthetic-secret", OTHER_TOKEN: "keep-me" };
+  const child = createChildProcessEnv(source);
+  assert.equal(child.PATH, "/usr/bin");
+  assert.equal(child.OTHER_TOKEN, "keep-me");
+  assert.equal(child.CODESPACE_AGENT_TOKEN, undefined);
+  assert.equal(source.CODESPACE_AGENT_TOKEN, "synthetic-secret");
+});
+
+test("bounded file reads preserve small files and reject oversized files", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-bounded-read-"));
+  try {
+    const small = path.join(dir, "small.txt"), large = path.join(dir, "large.txt");
+    await fs.writeFile(small, "hello");
+    await fs.writeFile(large, "0123456789");
+    assert.equal(await readFileBounded(small, 5), "hello");
+    await assert.rejects(readFileBounded(large, 5), /read limit.*chunked/i);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });

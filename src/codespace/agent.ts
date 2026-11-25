@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, inspectArchiveListing, matchesFilenamePattern, pruneEndedSessions, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createChildProcessEnv, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -16,6 +16,8 @@ const localRequire = createRequire(import.meta.url);
 const ptyModule = localRequire("node-pty");
 const baseUrl = (process.env.CODESPACE_AGENT_URL ?? "").replace(/\/+$/, "");
 const token = process.env.CODESPACE_AGENT_TOKEN ?? "";
+delete process.env.CODESPACE_AGENT_TOKEN;
+const childEnv = createChildProcessEnv();
 const codespace = process.env.CODESPACE_NAME ?? "";
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
 type Session = { child: any; output: string; ended: boolean; endedAt: number | null; exitCode: number | null; command: string; createdAt: string; pty: boolean };
@@ -29,12 +31,12 @@ function startSession(command: string, cwd = root, usePty = false) {
   const append = (chunk: string | Buffer) => { session.output = (session.output + chunk.toString()).slice(-100_000); };
   if (session.pty) {
     session.child = ptyModule.spawn("bash", ["-lc", command], {
-      name: "xterm-256color", cols: 120, rows: 30, cwd: safeCwd, env: process.env
+      name: "xterm-256color", cols: 120, rows: 30, cwd: safeCwd, env: childEnv
     });
     session.child.onData(append);
     session.child.onExit((event: { exitCode: number }) => { session.ended = true; session.endedAt = Date.now(); session.exitCode = event.exitCode; });
   } else {
-    session.child = spawn("bash", ["-lc", command], { cwd: safeCwd, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+    session.child = spawn("bash", ["-lc", command], { cwd: safeCwd, env: childEnv, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     session.child.stdout.on("data", append);
     session.child.stderr.on("data", append);
     session.child.on("close", (code: number | null) => { session.ended = true; session.endedAt = Date.now(); session.exitCode = code; });
@@ -83,7 +85,7 @@ async function run(command: string, args: string[], cwd = root, timeout = 30_000
   const timeoutMs = Math.min(Math.max(timeout, 1000), 120_000);
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(executable, args, {
-      cwd: safeCwd, env: process.env, stdio: ["ignore", "pipe", "pipe"],
+      cwd: safeCwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32", windowsHide: true
     });
     let stdout = "", stderr = "", totalBytes = 0, timedOut = false, overflow = false, settled = false;
@@ -143,24 +145,36 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       return { name: codespace, root, cwd: process.cwd(), platform: os.platform(), release: os.release(), arch: os.arch(), cpus: os.cpus().length, memoryBytes: os.totalmem(), node: process.version };
     case "fs.list": {
       const dir = resolvePath(a.path ?? ".");
-      return Promise.all((await fs.readdir(dir, { withFileTypes: true })).map(async d => {
-        const full = path.join(dir, d.name); const stat = await fs.stat(full);
-        return { name: d.name, path: path.relative(root, full), type: d.isDirectory() ? "directory" : d.isFile() ? "file" : "other", size: stat.size, modifiedAt: stat.mtime.toISOString() };
+      const entries: import("node:fs").Dirent[] = [];
+      const directory = await fs.opendir(dir);
+      for await (const entry of directory) {
+        if (entries.length >= 1000) throw new Error("Directory listing exceeds the 1000-entry limit.");
+        entries.push(entry);
+      }
+      return Promise.all(entries.map(async d => {
+        const full = path.join(dir, d.name); const stat = await fs.lstat(full);
+        return { name: d.name, path: path.relative(root, full), type: stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other", size: stat.size, modifiedAt: stat.mtime.toISOString() };
       }));
     }
-    case "fs.read": return fs.readFile(resolvePath(a.path), "utf8");
+    case "fs.read": return readFileBounded(resolvePath(a.path), 512 * 1024);
     case "fs.stat": {
       const target = resolvePath(a.path);
-      const stat = await fs.stat(target);
-      return { path: path.relative(root, target), type: stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other", size: stat.size, mode: stat.mode, permissions: (stat.mode & 0o777).toString(8), createdAt: stat.birthtime.toISOString(), modifiedAt: stat.mtime.toISOString(), accessedAt: stat.atime.toISOString(), isSymbolicLink: (await fs.lstat(target)).isSymbolicLink() };
+      const stat = await fs.lstat(target);
+      return { path: path.relative(root, target), type: stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other", size: stat.size, mode: stat.mode, permissions: (stat.mode & 0o777).toString(8), createdAt: stat.birthtime.toISOString(), modifiedAt: stat.mtime.toISOString(), accessedAt: stat.atime.toISOString(), isSymbolicLink: stat.isSymbolicLink() };
     }
     case "fs.find": {
-      const matches: string[] = [], max = Math.min(Math.max(a.maxResults ?? 100, 1), 500);
+      const matches: string[] = [];
+      const requestedMax = Number(a.maxResults ?? 100);
+      const max = Number.isFinite(requestedMax) ? Math.min(Math.max(Math.trunc(requestedMax), 1), 500) : 100;
       const pattern = String(a.pattern);
+      if (!pattern || pattern.length > 4096) throw new Error("Filename pattern must contain 1-4096 characters.");
       const searchRoot = resolvePath(a.path ?? ".");
+      let visitedEntries = 0;
       async function walk(dir: string): Promise<void> {
         if (matches.length >= max) return;
-        for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        const directory = await fs.opendir(dir);
+        for await (const entry of directory) {
+          if (++visitedEntries > 5000) throw new Error("Filesystem find exceeds the 5000-entry traversal limit; narrow the search path.");
           if ([".git", "node_modules", ".venv"].includes(entry.name)) continue;
           const full = resolvePath(path.relative(root, path.join(dir, entry.name)));
           if (matchesFilenamePattern(path.relative(searchRoot, full), pattern)) matches.push(path.relative(root, full));
@@ -198,16 +212,27 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       await fs.rename(from, to); return { moved: true };
     }
     case "fs.search": {
-      const matches: string[] = [], max = Math.min(Math.max(a.maxResults ?? 100, 1), 500);
+      const matches: string[] = [];
+      const requestedMax = Number(a.maxResults ?? 100);
+      const max = Number.isFinite(requestedMax) ? Math.min(Math.max(Math.trunc(requestedMax), 1), 500) : 100;
       const needle = String(a.query).toLowerCase();
+      if (!needle || needle.length > 4096) throw new Error("Search query must contain 1-4096 characters.");
+      let scannedFiles = 0, scannedBytes = 0, visitedEntries = 0;
       async function walk(dir: string): Promise<void> {
         if (matches.length >= max) return;
-        for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        const directory = await fs.opendir(dir);
+        for await (const entry of directory) {
+          if (++visitedEntries > 5000) throw new Error("Filesystem search exceeds the 5000-entry traversal limit; narrow the search path.");
           if ([".git", "node_modules", ".venv"].includes(entry.name)) continue;
           const full = resolvePath(path.relative(root, path.join(dir, entry.name)));
           if (entry.isDirectory()) await walk(full);
           else if (entry.isFile()) {
-            try { if ((await fs.readFile(full, "utf8")).toLowerCase().includes(needle)) matches.push(path.relative(root, full)); } catch {}
+            if (++scannedFiles > 1000) throw new Error("Filesystem search exceeds the 1000-file scan limit; narrow the search path.");
+            const stat = await fs.stat(full);
+            if (stat.size > 1024 * 1024) continue;
+            scannedBytes += stat.size;
+            if (scannedBytes > 16 * 1024 * 1024) throw new Error("Filesystem search exceeds the 16 MiB aggregate read limit; narrow the search path.");
+            try { if ((await readFileBounded(full, 1024 * 1024)).toLowerCase().includes(needle)) matches.push(path.relative(root, full)); } catch (error) { if (!(error instanceof Error && /read limit/.test(error.message))) throw error; }
           }
           if (matches.length >= max) break;
         }
@@ -257,9 +282,13 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       session.child.resize(cols, rows);
       return { resized: true, cols, rows };
     }
-    case "process.list": return run("ps", ["-eo", "pid,ppid,stat,etime,args"]);
+    case "process.list": return run("ps", ["-eo", "pid,ppid,stat,etime,comm"]);
     case "process.start": return startSession(String(a.command), a.cwd ? resolvePath(a.cwd) : root);
-    case "process.inspect": return run("ps", ["-p", String(a.pid), "-o", "pid,ppid,stat,etime,args"]);
+    case "process.inspect": {
+      const pid = Number(a.pid);
+      if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error("A valid process PID is required.");
+      return run("ps", ["-p", String(pid), "-o", "pid,ppid,stat,etime,comm"]);
+    }
     case "process.logs": return readSession(String(a.sessionId), Boolean(a.clear));
     case "process.kill": {
       const pid = Number(a.pid);
@@ -332,10 +361,13 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       if ([...debugSessions.values()].filter(session => !session.ended).length >= 20) throw new Error("Debug-adapter session limit reached (20 active sessions).");
       const command = Array.isArray(a.command) ? a.command.map(String) : [];
       if (!command.length || command.length > 64 || command.some(part => part.length > 4096)) throw new Error("Debug adapter command must be a non-empty argv array.");
-      const child = spawn(command[0], command.slice(1), { cwd: a.cwd ? resolvePath(a.cwd) : root, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+      const child = spawn(command[0], command.slice(1), { cwd: a.cwd ? resolvePath(a.cwd) : root, env: childEnv, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
       const id = randomUUID();
-      const session: DebugSession = { child, buffer: Buffer.alloc(0), messages: [], stderr: "", ended: false, endedAt: null, exitCode: null };
-      child.stdout.on("data", (chunk: Buffer) => { try { session.buffer = Buffer.concat([session.buffer, chunk]); parseDebugMessages(session); } catch (error) { session.stderr = (session.stderr + (error instanceof Error ? error.message : String(error))).slice(-50_000); signalChildTree(child, "SIGTERM"); } });
+      const session: DebugSession = { child, buffer: Buffer.alloc(0), messages: [], queuedBytes:0, stderr: "", ended: false, endedAt: null, exitCode: null };
+      child.stdout.on("data", (chunk: Buffer) => { try { assertProtocolBufferCapacity(session.buffer.length,chunk.length,MAX_DEBUG_BUFFER_BYTES);session.buffer = Buffer.concat([session.buffer, chunk]); parseDebugMessages(session); } catch (error) { session.stderr = (session.stderr + (error instanceof Error ? error.message : String(error))).slice(-50_000);
+        child.stdout.pause();session.buffer=Buffer.alloc(0);session.messages=[];session.queuedBytes=0;
+        signalChildTree(child, "SIGTERM");
+        const forceTimer=setTimeout(()=>{if(child.exitCode===null&&child.signalCode===null)signalChildTree(child,"SIGKILL");},1000);forceTimer.unref(); } });
       child.stderr.on("data", (chunk: Buffer) => { session.stderr = (session.stderr + chunk.toString("utf8")).slice(-50_000); });
       child.on("close", (code: number | null) => { session.ended = true; session.endedAt = Date.now(); session.exitCode = code; });
       child.on("error", (error: Error) => { session.stderr = (session.stderr + error.message).slice(-50_000); session.ended = true; session.endedAt = Date.now(); });
@@ -350,14 +382,19 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("message must be a DAP JSON object.");
       const body = Buffer.from(JSON.stringify(message), "utf8");
       if (body.length > 8 * 1024 * 1024) throw new Error("DAP message exceeds 8 MiB.");
-      session.child.stdin.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]));
+      const frame=Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]);
+      const writable=session.child.stdin;
+      if(writable.writableLength+frame.length>MAX_DEBUG_QUEUE_BYTES)throw new Error("Debug-adapter input backpressure limit exceeded.");
+      if(!writable.write(frame))await new Promise<void>((resolve,reject)=>{const timer=setTimeout(()=>{cleanup();reject(new Error("Debug-adapter input drain timed out."));},10000);const cleanup=()=>{clearTimeout(timer);writable.off("drain",onDrain);writable.off("error",onError);writable.off("close",onClose);};const onDrain=()=>{cleanup();resolve();};const onError=(error:Error)=>{cleanup();reject(error);};const onClose=()=>{cleanup();reject(new Error("Debug-adapter input closed before draining."));};writable.once("drain",onDrain);writable.once("error",onError);writable.once("close",onClose);});
       return { sent: true, bytes: body.length };
     }
     case "debug.read": {
       const session = debugSessions.get(String(a.sessionId));
       if (!session) throw new Error("Unknown debug adapter session.");
       const limit = Math.min(Math.max(Number(a.maxMessages ?? 100), 1), 500);
-      return { messages: session.messages.splice(0, limit), stderr: session.stderr, running: !session.ended, exitCode: session.exitCode };
+      const messages=session.messages.splice(0,limit);
+      session.queuedBytes-=messages.reduce((total,item)=>total+item.bytes,0);
+      return { messages: messages.map(item=>{try{return JSON.parse(item.body);}catch{return {parseError:true,body:item.body};}}), stderr: session.stderr, running: !session.ended, exitCode: session.exitCode };
     }
     case "debug.close": {
       const session = debugSessions.get(String(a.sessionId));
@@ -371,7 +408,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     }
     case "environment.tools": {
       const checks = await Promise.all(["node", "npm", "pnpm", "yarn", "git", "python3", "pip3", "docker", "gh", "code", "devcontainer"].map(async name => {
-        try { const r = await execFileAsync(name, ["--version"], { cwd: root, timeout: 5000, maxBuffer: 8192 }); return { name, available: true, version: (r.stdout || r.stderr).trim().split("\n")[0] }; }
+        try { const r = await execFileAsync(name, ["--version"], { cwd: root, timeout: 5000, maxBuffer: 8192, env: childEnv }); return { name, available: true, version: (r.stdout || r.stderr).trim().split("\n")[0] }; }
         catch { return { name, available: false }; }
       }));
       return checks;
@@ -516,6 +553,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       const visibility = String(a.visibility);
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be between 1 and 65535.");
       if (!["private", "org", "public"].includes(visibility)) throw new Error("visibility must be private, org, or public.");
+      requirePublicPortConfirmation(visibility,a.confirm===true);
       try {
         const result = await run("gh", ["codespace", "ports", "visibility", `${port}:${visibility}`, "--codespace", codespace], root, 30000);
         return { updated: true, available: true, codespace, port, visibility, ...result };
@@ -533,7 +571,8 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "ports.check": {
       const port = Number(a.port);
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be between 1 and 65535.");
-      const host = String(a.host ?? "127.0.0.1");
+      const host = String(a.host ?? "127.0.0.1").trim().replace(/^\[|\]$/g, "");
+      if (!isLoopbackHost(host)) throw new Error("Port checks are restricted to localhost and loopback IP addresses.");
       const timeoutMs = Math.min(Math.max(Number(a.timeoutMs ?? 2000), 250), 10000);
       return await new Promise(resolve => {
         const socket = net.createConnection({ host, port });
@@ -570,30 +609,35 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       }
       return { extracted: true, entries: limits.entries, uncompressedBytes: limits.uncompressedBytes, destination: path.relative(root, destination) };
     }
-    case "transfer.read": return { contentBase64: (await fs.readFile(resolvePath(a.path))).toString("base64") };
+    case "transfer.read": return { contentBase64: (await readFileBufferBounded(resolvePath(a.path), 512 * 1024)).toString("base64") };
     case "transfer.write": await fs.writeFile(resolvePath(a.path), Buffer.from(String(a.contentBase64), "base64")); return { written: true };
     default: throw new Error(`Unsupported agent operation: ${operation}`);
   }
 }
 
-type DebugSession = { child: ReturnType<typeof spawn>; buffer: Buffer; messages: unknown[]; stderr: string; ended: boolean; endedAt: number | null; exitCode: number | null };
+type DebugSession = { child: ReturnType<typeof spawn>; buffer: Buffer; messages: Array<{body:string;bytes:number}>; queuedBytes:number; stderr: string; ended: boolean; endedAt: number | null; exitCode: number | null };
 const debugSessions = new Map<string, DebugSession>();
+const MAX_DEBUG_MESSAGE_BYTES=8*1024*1024;
+const MAX_DEBUG_HEADER_BYTES=8192;
+const MAX_DEBUG_BUFFER_BYTES=MAX_DEBUG_MESSAGE_BYTES+MAX_DEBUG_HEADER_BYTES;
+const MAX_DEBUG_QUEUE_BYTES=8*1024*1024;
 function parseDebugMessages(session: DebugSession): void {
   while (true) {
     const boundary = session.buffer.indexOf("\r\n\r\n");
     if (boundary < 0) return;
     const header = session.buffer.subarray(0, boundary).toString("ascii");
     const match = header.match(/(?:^|\r\n)Content-Length:\s*(\d+)/i);
+    if (boundary > MAX_DEBUG_HEADER_BYTES) throw new Error("DAP header exceeds 8 KiB.");
     if (!match) throw new Error("Invalid Debug Adapter Protocol header.");
     const length = Number(match[1]);
-    if (!Number.isSafeInteger(length) || length < 0 || length > 8 * 1024 * 1024) throw new Error("Invalid Debug Adapter Protocol message length.");
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_DEBUG_MESSAGE_BYTES) throw new Error("Invalid Debug Adapter Protocol message length.");
     const start = boundary + 4;
     if (session.buffer.length < start + length) return;
+    assertProtocolQueueCapacity(session.queuedBytes,length,MAX_DEBUG_QUEUE_BYTES,session.messages.length,4096);
     const body = session.buffer.subarray(start, start + length).toString("utf8");
+    const charge=Math.max(length,256);
     session.buffer = session.buffer.subarray(start + length);
-    try { session.messages.push(JSON.parse(body)); }
-    catch { session.messages.push({ parseError: true, body }); }
-    if (session.messages.length > 500) session.messages.shift();
+    session.messages.push({body,bytes:charge});session.queuedBytes+=charge;
   }
 }
 const MAX_RELAY_RESPONSE_BYTES = 1024 * 1024;
@@ -665,10 +709,15 @@ export async function runCodespaceAgent(): Promise<void> {
       let value: unknown, ok = true;
       try { value = await execute(job.operation, job.args); }
       catch (error) { ok = false; value = error instanceof Error ? error.message : String(error); }
+      let resultBody = JSON.stringify({ id: job.id, codespace, ok, value });
+      if (Buffer.byteLength(resultBody, "utf8") > 900 * 1024) {
+        ok = false; value = "Job result exceeded the 900 KiB response limit. Use chunked transfer.download.chunk for large files.";
+        resultBody = JSON.stringify({ id: job.id, codespace, ok, value });
+      }
       let delivered = false;
       for (let attempt=0; attempt<5 && !stopping; attempt++) {
         try {
-          const response = await request(`${baseUrl}/codespaces/agent/result`, { method:"POST", body:JSON.stringify({id:job.id,codespace,ok,value}) });
+          const response = await request(`${baseUrl}/codespaces/agent/result`, { method:"POST", body:resultBody });
           if (!response.ok) throw new Error(`Result delivery failed: ${response.status}`);
           const receipt = await readJsonLimited(response) as { accepted?: boolean };
           if (receipt.accepted !== true) throw new Error("Relay rejected or expired this job result.");

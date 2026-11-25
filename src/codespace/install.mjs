@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-import { readFile, writeFile, mkdir, copyFile, access } from "node:fs/promises";
+import { constants } from "node:fs";
+import { readFile, writeFile, mkdir, copyFile, access, lstat, rename, unlink } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -30,7 +32,27 @@ const requiredScripts = {
 };
 const fail = message => { console.error(message); process.exit(1); };
 const exists = async file => access(file).then(() => true).catch(() => false);
+async function assertNoSymlinkPath(target) {
+  const absolute=path.resolve(target), parsed=path.parse(absolute);
+  let current=parsed.root;
+  for(const part of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current=path.join(current,part);
+    try { if((await lstat(current)).isSymbolicLink()) throw new Error(`Refusing installer path containing a symbolic link: ${current}`); }
+    catch(error) { if(error?.code==="ENOENT"||error?.code==="ENOTDIR") break; throw error; }
+  }
+}
+async function atomicWrite(target, content) {
+  await assertNoSymlinkPath(path.dirname(target));
+  const temp=path.join(path.dirname(target),`.${path.basename(target)}.${randomUUID()}.tmp`);
+  await writeFile(temp,content,{flag:"wx"});
+  try { await rename(temp,target); } catch(error) { await unlink(temp).catch(()=>undefined); throw error; }
+}
 
+await assertNoSymlinkPath(targetRoot);
+await assertNoSymlinkPath(destination);
+await assertNoSymlinkPath(packagePath);
+await assertNoSymlinkPath(devcontainerPath);
+await assertNoSymlinkPath(fragmentPath);
 if (!(await exists(packagePath))) fail(`No package.json found in target project: ${targetRoot}`);
 let targetPackage;
 try { targetPackage = JSON.parse(await readFile(packagePath, "utf8")); }
@@ -95,8 +117,12 @@ if (needsManualDevcontainerMerge && await exists(fragmentPath)) {
 
 const pendingCopies = [];
 for (const relative of manifest.payload) {
-  const source = path.join(moduleRoot, relative);
-  const target = path.join(destination, relative);
+  if (typeof relative !== "string" || !relative || path.isAbsolute(relative) || relative.split(/[\\/]/).some(part => part === ".." || part === "")) fail(`Unsafe module payload path: ${relative}`);
+  const source = path.resolve(moduleRoot, relative);
+  if (source !== moduleRoot && !source.startsWith(moduleRoot + path.sep)) fail(`Module payload escapes its source directory: ${relative}`);
+  const target = path.resolve(destination, relative);
+  if (target !== destination && !target.startsWith(destination + path.sep)) fail(`Module payload escapes its destination directory: ${relative}`);
+  await assertNoSymlinkPath(target);
   if (await exists(target)) {
     const [sourceBytes, targetBytes] = await Promise.all([readFile(source), readFile(target)]);
     if (!sourceBytes.equals(targetBytes)) {
@@ -106,17 +132,19 @@ for (const relative of manifest.payload) {
 }
 
 await mkdir(destination, { recursive: true });
+await assertNoSymlinkPath(destination);
 for (const item of pendingCopies) {
   await mkdir(path.dirname(item.target), { recursive: true });
-  await copyFile(item.source, item.target);
+  await assertNoSymlinkPath(item.target);
+  await copyFile(item.source, item.target, constants.COPYFILE_EXCL);
 }
-await writeFile(packagePath, JSON.stringify(targetPackage, null, 2) + "\n");
+await atomicWrite(packagePath, JSON.stringify(targetPackage, null, 2) + "\n");
 if (nextDevcontainer !== null) {
   await mkdir(path.dirname(devcontainerPath), { recursive: true });
-  await writeFile(devcontainerPath, nextDevcontainer);
+  await atomicWrite(devcontainerPath, nextDevcontainer);
 } else if (needsManualDevcontainerMerge) {
   await mkdir(path.dirname(fragmentPath), { recursive: true });
-  await writeFile(fragmentPath, fragmentText);
+  await atomicWrite(fragmentPath, fragmentText);
   console.warn(`Dev Container config uses JSONC or unsupported lifecycle command shapes. Original config was preserved; merge ${fragmentPath} manually.`);
 }
 

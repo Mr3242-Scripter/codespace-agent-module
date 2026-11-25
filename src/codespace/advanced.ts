@@ -6,10 +6,11 @@ import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { assertNoSymlinkComponents, assertUploadCapacity, isExpired, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, isExpired, linkFileNoReplace, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
+const childEnv = createChildProcessEnv();
 const startedAt = Date.now();
 
 function safePath(input = "."): string {
@@ -20,7 +21,7 @@ function safePath(input = "."): string {
 }
 async function command(bin: string, args: string[], timeout = 15000) {
   try {
-    const result = await execFileAsync(bin, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+    const result = await execFileAsync(bin, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: childEnv });
     return { available: true, exitCode: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (error: any) {
     const missing = error?.code === "ENOENT";
@@ -147,7 +148,7 @@ async function vscodeConfig(a: any) {
 
 type WatchSession = { watcher: ReturnType<typeof watchFs>; events: Array<{event:string;filename:string|null;at:string}> };
 const watchSessions = new Map<string,WatchSession>();
-type TransferSession = { path:string; tempPath:string; expectedSize:number; received:number; lastActivityAt:number };
+type TransferSession = { path:string; tempPath:string; expectedSize:number; received:number; lastActivityAt:number; overwrite:boolean };
 const uploadTransfers = new Map<string,TransferSession>();
 const UPLOAD_TTL_MS = 15 * 60_000;
 const MAX_UPLOAD_SESSIONS = 20;
@@ -166,22 +167,28 @@ async function cleanupExpiredUploads(now = Date.now()): Promise<number> {
 const uploadCleanupTimer = setInterval(() => { void cleanupExpiredUploads(); }, 60_000);
 uploadCleanupTimer.unref?.();
 
-type LspSession = { child: ReturnType<typeof spawn>; buffer: Buffer; messages: unknown[]; stderr: string; ended: boolean; endedAt: number | null; exitCode: number | null };
+type LspSession = { child: ReturnType<typeof spawn>; buffer: Buffer; messages: Array<{body:string;bytes:number}>; queuedBytes:number; stderr: string; ended: boolean; endedAt: number | null; exitCode: number | null };
 const lspSessions = new Map<string,LspSession>();
+const MAX_PROTOCOL_MESSAGE_BYTES=8*1024*1024;
+const MAX_PROTOCOL_HEADER_BYTES=8192;
+const MAX_PROTOCOL_BUFFER_BYTES=MAX_PROTOCOL_MESSAGE_BYTES+MAX_PROTOCOL_HEADER_BYTES;
+const MAX_PROTOCOL_QUEUE_BYTES=8*1024*1024;
 function parseLsp(session: LspSession) {
   while (true) {
     const boundary=session.buffer.indexOf("\r\n\r\n");
     if(boundary<0)return;
     const header=session.buffer.subarray(0,boundary).toString("ascii");
     const match=header.match(/(?:^|\r\n)Content-Length:\s*(\d+)/i);
+    if(boundary>MAX_PROTOCOL_HEADER_BYTES)throw new Error("JSON-RPC header exceeds 8 KiB.");
     if(!match)throw new Error("Invalid JSON-RPC Content-Length header.");
     const length=Number(match[1]), start=boundary+4;
-    if(!Number.isSafeInteger(length)||length<0||length>8*1024*1024)throw new Error("Invalid JSON-RPC message length.");
+    if(!Number.isSafeInteger(length)||length<0||length>MAX_PROTOCOL_MESSAGE_BYTES)throw new Error("Invalid JSON-RPC message length.");
     if(session.buffer.length<start+length)return;
+    assertProtocolQueueCapacity(session.queuedBytes,length,MAX_PROTOCOL_QUEUE_BYTES,session.messages.length,4096);
     const body=session.buffer.subarray(start,start+length).toString("utf8");
+    const charge=Math.max(length,256);
     session.buffer=session.buffer.subarray(start+length);
-    try{session.messages.push(JSON.parse(body));}catch{session.messages.push({parseError:true,body});}
-    if(session.messages.length>1000)session.messages.shift();
+    session.messages.push({body,bytes:charge});session.queuedBytes+=charge;
   }
 }
 async function runTask(task: string, args: string[] = [], timeoutMs = 120000) {
@@ -221,7 +228,7 @@ async function runTask(task: string, args: string[] = [], timeoutMs = 120000) {
     return {task,manager,exitCode:1,stdout:"",stderr:`Task '${task}' is not defined in package.json and no safe automatic fallback applies.`};
   }
   try{
-    const result=await execFileAsync(executable,commandArgs,{cwd:root,timeout:Math.min(Math.max(timeoutMs,1000),600000),maxBuffer:8*1024*1024,windowsHide:true});
+    const result=await execFileAsync(executable,commandArgs,{cwd:root,timeout:Math.min(Math.max(timeoutMs,1000),600000),maxBuffer:8*1024*1024,windowsHide:true,env:childEnv});
     return {task,manager,runner:executable,exitCode:0,stdout:result.stdout,stderr:result.stderr};
   }catch(error:any){
     return {task,manager,runner:executable,exitCode:typeof error?.code==="number"?error.code:null,stdout:error?.stdout??"",stderr:error?.stderr??error?.message??String(error)};
@@ -299,7 +306,7 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       await fs.mkdir(path.dirname(target),{recursive:true});
       const id=randomUUID(), tempPath=path.join(path.dirname(target),`.${path.basename(target)}.codespace-${id}.upload`);
       await fs.writeFile(tempPath,Buffer.alloc(0),{flag:"wx"});
-      uploadTransfers.set(id,{path:target,tempPath,expectedSize,received:0,lastActivityAt:Date.now()});
+      uploadTransfers.set(id,{path:target,tempPath,expectedSize,received:0,lastActivityAt:Date.now(),overwrite:a.overwrite===true});
       return {sessionId:id,path:path.relative(root,target),expectedSize,chunkBytes:256*1024};
     }
     case "transfer.upload.chunk": {
@@ -320,7 +327,13 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       const id=String(a.sessionId),session=uploadTransfers.get(id);
       if(!session)throw new Error("Unknown upload session.");
       if(session.received!==session.expectedSize)throw new Error(`Upload incomplete: received ${session.received} of ${session.expectedSize} bytes.`);
-      await fs.rename(session.tempPath,session.path);
+      safePath(path.relative(root,session.path));
+      if (session.overwrite) {
+        await fs.rename(session.tempPath,session.path);
+      } else {
+        // link() is an atomic no-replace operation on the same filesystem.
+        await linkFileNoReplace(session.tempPath,session.path);
+      }
       uploadTransfers.delete(id);
       return {committed:true,path:path.relative(root,session.path),bytes:session.received};
     }
@@ -366,10 +379,13 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       if ([...lspSessions.values()].filter(session => !session.ended).length >= 20) throw new Error("Language-server session limit reached (20 active sessions).");
       const argv=Array.isArray(a.command)?a.command.map(String):[];
       if(!argv.length||argv.length>64||argv.some(x=>x.length>4096))throw new Error("LSP command must be a non-empty argv array.");
-      const child=spawn(argv[0],argv.slice(1),{cwd:safePath(a.cwd??"."),env:process.env,stdio:["pipe","pipe","pipe"]});
+      const child=spawn(argv[0],argv.slice(1),{cwd:safePath(a.cwd??"."),env:childEnv,stdio:["pipe","pipe","pipe"]});
       const id=randomUUID();
-      const session:LspSession={child,buffer:Buffer.alloc(0),messages:[],stderr:"",ended:false,endedAt:null,exitCode:null};
-      child.stdout.on("data",(chunk:Buffer)=>{try{session.buffer=Buffer.concat([session.buffer,chunk]);parseLsp(session);}catch(error){session.stderr=(session.stderr+String(error)).slice(-50000);child.kill("SIGTERM");}});
+      const session:LspSession={child,buffer:Buffer.alloc(0),messages:[],queuedBytes:0,stderr:"",ended:false,endedAt:null,exitCode:null};
+      child.stdout.on("data",(chunk:Buffer)=>{try{assertProtocolBufferCapacity(session.buffer.length,chunk.length,MAX_PROTOCOL_BUFFER_BYTES);session.buffer=Buffer.concat([session.buffer,chunk]);parseLsp(session);}catch(error){session.stderr=(session.stderr+String(error)).slice(-50000);
+        child.stdout.pause();session.buffer=Buffer.alloc(0);session.messages=[];session.queuedBytes=0;
+        child.kill("SIGTERM");
+        const forceTimer=setTimeout(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill("SIGKILL");},1000);forceTimer.unref();}});
       child.stderr.on("data",(chunk:Buffer)=>{session.stderr=(session.stderr+chunk.toString("utf8")).slice(-50000);});
       child.on("close",(code:number|null)=>{session.ended=true;session.endedAt=Date.now();session.exitCode=code;});
       child.on("error",(error:Error)=>{session.stderr=(session.stderr+error.message).slice(-50000);session.ended=true;session.endedAt=Date.now();});
@@ -382,13 +398,18 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       if(!session||session.ended)throw new Error("Language server session is not running.");
       const body=Buffer.from(JSON.stringify(a.message),"utf8");
       if(body.length>8*1024*1024)throw new Error("LSP message exceeds 8 MiB.");
-      session.child.stdin.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`),body]));
+      const frame=Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`),body]);
+      const writable=session.child.stdin;
+      if(writable.writableLength+frame.length>MAX_PROTOCOL_QUEUE_BYTES)throw new Error("Language-server input backpressure limit exceeded.");
+      if(!writable.write(frame))await new Promise<void>((resolve,reject)=>{const timer=setTimeout(()=>{cleanup();reject(new Error("Language-server input drain timed out."));},10000);const cleanup=()=>{clearTimeout(timer);writable.off("drain",onDrain);writable.off("error",onError);writable.off("close",onClose);};const onDrain=()=>{cleanup();resolve();};const onError=(error:Error)=>{cleanup();reject(error);};const onClose=()=>{cleanup();reject(new Error("Language-server input closed before draining."));};writable.once("drain",onDrain);writable.once("error",onError);writable.once("close",onClose);});
       return {sent:true,bytes:body.length};
     }
     case "lsp.read": {
       const session=lspSessions.get(String(a.sessionId));
       if(!session)throw new Error("Unknown language server session.");
-      return {messages:session.messages.splice(0,Math.min(Math.max(Number(a.maxMessages??100),1),500)),stderr:session.stderr,running:!session.ended,exitCode:session.exitCode};
+      const messages=session.messages.splice(0,Math.min(Math.max(Number(a.maxMessages??100),1),500));
+      session.queuedBytes-=messages.reduce((total,item)=>total+item.bytes,0);
+      return {messages:messages.map(item=>{try{return JSON.parse(item.body);}catch{return {parseError:true,body:item.body};}}),stderr:session.stderr,running:!session.ended,exitCode:session.exitCode};
     }
     case "lsp.close": {
       const session=lspSessions.get(String(a.sessionId));
