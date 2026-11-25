@@ -182,7 +182,7 @@ async function vscodeConfig(a: any) {
 
 type WatchSession = { watcher: ReturnType<typeof watchFs>; events: Array<{event:string;filename:string|null;at:string}> };
 const watchSessions = new Map<string,WatchSession>();
-type TransferSession = { path:string; tempPath:string; expectedSize:number; received:number; lastActivityAt:number; overwrite:boolean };
+type TransferSession = { path:string; tempPath:string; expectedSize:number; received:number; lastActivityAt:number; overwrite:boolean; busy:boolean };
 const uploadTransfers = new Map<string,TransferSession>();
 const UPLOAD_TTL_MS = 15 * 60_000;
 const MAX_UPLOAD_SESSIONS = 20;
@@ -191,7 +191,7 @@ const MAX_AGGREGATE_UPLOAD_BYTES = 512 * 1024 * 1024;
 async function cleanupExpiredUploads(now = Date.now()): Promise<number> {
   let removed = 0;
   for (const [id, session] of uploadTransfers) {
-    if (!isExpired(session.lastActivityAt, now, UPLOAD_TTL_MS)) continue;
+    if (session.busy || !isExpired(session.lastActivityAt, now, UPLOAD_TTL_MS)) continue;
     await fs.unlink(session.tempPath).catch(() => undefined);
     uploadTransfers.delete(id);
     removed++;
@@ -348,42 +348,78 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       await fs.mkdir(path.dirname(target),{recursive:true});
       const id=randomUUID(), tempPath=path.join(path.dirname(target),`.${path.basename(target)}.codespace-${id}.upload`);
       await fs.writeFile(tempPath,Buffer.alloc(0),{flag:"wx"});
-      uploadTransfers.set(id,{path:target,tempPath,expectedSize,received:0,lastActivityAt:Date.now(),overwrite:a.overwrite===true});
+      uploadTransfers.set(id,{path:target,tempPath,expectedSize,received:0,lastActivityAt:Date.now(),overwrite:a.overwrite===true,busy:false});
       return {sessionId:id,path:path.relative(root,target),expectedSize,chunkBytes:256*1024};
     }
     case "transfer.upload.chunk": {
       await cleanupExpiredUploads();
       const session=uploadTransfers.get(String(a.sessionId));
       if(!session)throw new Error("Unknown upload session.");
-      const offset=Number(a.offset), data=Buffer.from(String(a.contentBase64??""),"base64");
+      if(session.busy)throw new Error("Another operation is already using this upload session.");
+      const offset=Number(a.offset), encoded=String(a.contentBase64??""), data=Buffer.from(encoded,"base64");
       if(offset!==session.received)throw new Error(`Expected offset ${session.received}.`);
+      if(!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)||data.toString("base64")!==encoded)throw new Error("Chunk content must be canonical base64.");
       if(!data.length||data.length>256*1024)throw new Error("Chunk must contain 1-262144 bytes.");
       if(session.received+data.length>session.expectedSize)throw new Error("Chunk exceeds declared upload size.");
-      await fs.appendFile(session.tempPath,data);
-      session.received+=data.length;
-      session.lastActivityAt=Date.now();
-      return {received:session.received,expectedSize:session.expectedSize,complete:session.received===session.expectedSize};
+      session.busy=true;
+      const previousReceived=session.received;
+      let handle;
+      let safeToRollback=false;
+      try {
+        handle=await fs.open(session.tempPath,constants.O_WRONLY|constants.O_APPEND|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+        const stat=await handle.stat();
+        if(!stat.isFile()||stat.nlink!==1||stat.size!==previousReceived)throw new Error("Upload staging file changed or is hard-linked; abort and restart the upload.");
+        safeToRollback=true;
+        await handle.writeFile(data);
+        await handle.sync();
+        session.received+=data.length;
+        session.lastActivityAt=Date.now();
+        return {received:session.received,expectedSize:session.expectedSize,complete:session.received===session.expectedSize};
+      } catch(error) {
+        if(handle&&safeToRollback)await handle.truncate(previousReceived).catch(()=>undefined);
+        throw error;
+      } finally {
+        await handle?.close().catch(()=>undefined);
+        session.busy=false;
+      }
     }
     case "transfer.upload.commit": {
       await cleanupExpiredUploads();
       const id=String(a.sessionId),session=uploadTransfers.get(id);
       if(!session)throw new Error("Unknown upload session.");
+      if(session.busy)throw new Error("Another operation is already using this upload session.");
       if(session.received!==session.expectedSize)throw new Error(`Upload incomplete: received ${session.received} of ${session.expectedSize} bytes.`);
       safePath(path.relative(root,session.path));
-      if (session.overwrite) {
-        await fs.rename(session.tempPath,session.path);
-      } else {
-        // link() is an atomic no-replace operation on the same filesystem.
-        await linkFileNoReplace(session.tempPath,session.path);
-      }
-      uploadTransfers.delete(id);
-      return {committed:true,path:path.relative(root,session.path),bytes:session.received};
+      session.busy=true;
+      try {
+        const staged=await fs.open(session.tempPath,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+        let stagedStat;
+        try {
+          stagedStat=await staged.stat();
+          if(!stagedStat.isFile()||stagedStat.nlink!==1||stagedStat.size!==session.expectedSize)throw new Error("Upload staging file changed or is hard-linked; abort and restart the upload.");
+        } finally { await staged.close(); }
+        if (session.overwrite) {
+          await fs.rename(session.tempPath,session.path);
+        } else {
+          // link() is an atomic no-replace operation on the same filesystem.
+          await linkFileNoReplace(session.tempPath,session.path);
+        }
+        const installed=await fs.lstat(session.path);
+        if(!installed.isFile()||installed.isSymbolicLink()||installed.nlink!==1||installed.size!==session.expectedSize||installed.dev!==stagedStat.dev||installed.ino!==stagedStat.ino) {
+          // Never unlink a path that may have been replaced by another process after installation.
+          if(installed.dev===stagedStat.dev&&installed.ino===stagedStat.ino) await fs.unlink(session.path).catch(()=>undefined);
+          throw new Error("Upload staging file changed during commit; the destination was not retained.");
+        }
+        uploadTransfers.delete(id);
+        return {committed:true,path:path.relative(root,session.path),bytes:session.received};
+      } finally { session.busy=false; }
     }
     case "transfer.upload.abort": {
       await cleanupExpiredUploads();
       if(a.confirm!==true)throw new Error("Aborting an upload requires confirm=true.");
       const id=String(a.sessionId),session=uploadTransfers.get(id);
       if(!session)return {aborted:false,alreadyClosed:true};
+      if(session.busy)throw new Error("Cannot abort an upload while another operation is using it.");
       await fs.unlink(session.tempPath).catch(()=>undefined);
       uploadTransfers.delete(id);
       return {aborted:true,received:session.received};

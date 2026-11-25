@@ -94,6 +94,26 @@ async function validateGitTagName(value: unknown, cwd: string): Promise<string> 
   return name;
 }
 
+async function assertNoHardLinksInGitIndex(cwd: string): Promise<void> {
+  const topLevel = await run("git", ["rev-parse", "--show-toplevel"], cwd, 15_000, systemEnv);
+  const repositoryRoot = path.resolve(topLevel.stdout.trim());
+  const repositoryRelative = path.relative(root, repositoryRoot);
+  if (repositoryRelative === ".." || repositoryRelative.startsWith(".." + path.sep) || path.isAbsolute(repositoryRelative)) throw new Error("Git repository root is outside the workspace.");
+  const staged = await run("git", ["diff", "--cached", "--name-only", "-z"], cwd, 15_000, systemEnv);
+  for (const name of staged.stdout.split("\0").filter(Boolean)) {
+    const absolute = path.resolve(repositoryRoot, name);
+    const relative = path.relative(root, absolute);
+    if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) throw new Error("Git index contains a path outside the workspace.");
+    await assertNoSymlinkComponents(path.dirname(absolute), root);
+    try {
+      const stat = await fs.lstat(absolute);
+      if (!stat.isSymbolicLink()) await assertNoHardLinksInTree(absolute);
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+}
+
 async function runGitRemoteOperation(operation: "fetch" | "pull" | "push", remoteValue: unknown, branchValue: unknown, cwd: string) {
   const remote = String(remoteValue ?? "origin");
   if (!remote || remote.startsWith("-") || remote.length > 2048 || /[\0\r\n]/.test(remote)) throw new Error("Invalid Git remote.");
@@ -364,6 +384,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "git.commit": {
       const cwd = a.cwd ? resolvePath(a.cwd) : root;
       if (a.all) await run("git", ["add", "-A"], cwd);
+      await assertNoHardLinksInGitIndex(cwd);
       return run("git", ["commit", "-m", String(a.message)], cwd, 120_000);
     }
     case "git.fetch": return runGitRemoteOperation("fetch", a.remote, undefined, a.cwd ? resolvePath(a.cwd) : root);

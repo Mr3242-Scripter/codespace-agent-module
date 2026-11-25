@@ -31,6 +31,18 @@ PATH="$(filter_workspace_path "$PATH")"
 export PATH
 PID_FILE="${CODESPACE_AGENT_PID_FILE:-$HOME/.codespace-agent.pid}"
 LOG_FILE="${CODESPACE_AGENT_LOG_FILE:-$HOME/.codespace-agent.log}"
+if [[ "$PID_FILE" == "$LOG_FILE" ]]; then echo "Agent PID and log files must be different paths." >&2; exit 1; fi
+validate_state_file() {
+  local file="$1" links
+  if [[ -L "$file" ]]; then echo "Refusing symbolic-link agent state file: $file" >&2; return 1; fi
+  if [[ -e "$file" ]]; then
+    if [[ ! -f "$file" ]]; then echo "Agent state path must be a regular file: $file" >&2; return 1; fi
+    links="$(/usr/bin/stat -c '%h' -- "$file" 2>/dev/null || echo 0)"
+    if [[ "$links" != 1 ]]; then echo "Refusing hard-linked agent state file: $file" >&2; return 1; fi
+  fi
+}
+validate_state_file "$PID_FILE" || exit 1
+validate_state_file "$LOG_FILE" || exit 1
 log() { local message="$*"; printf '[%s] %s\n' "$(date -Is)" "$message" | tee -a "$LOG_FILE" >&2; }
 agent_pid() {
   [[ -f "$PID_FILE" ]] || return 1
@@ -83,8 +95,10 @@ start_agent() {
 
   log "Starting Codespaces agent for ${CODESPACE_NAME}."
   nohup "$tsx" "$ROOT/agent-entry.ts" >>"$LOG_FILE" 2>&1 </dev/null &
-  local pid=$!
-  printf '%s\n' "$pid" >"$PID_FILE"
+  local pid=$! pid_tmp
+  pid_tmp="$(mktemp "$(dirname "$PID_FILE")/.codespace-agent-pid.XXXXXX")"
+  printf '%s\n' "$pid" >"$pid_tmp"
+  mv -fT -- "$pid_tmp" "$PID_FILE"
   for _ in {1..6}; do
     if agent_pid >/dev/null; then log "Codespaces agent process started (PID $pid)."; return 0; fi
     if ! kill -0 "$pid" 2>/dev/null; then break; fi

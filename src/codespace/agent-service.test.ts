@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync, linkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -138,6 +138,40 @@ test("foreground agent launcher sanitizes verification but preserves its token f
     assert.ok(captured.includes("BASH_FUNC_evil=missing"));
     assert.equal(readFileSync(join(fixture.root, "agent-launch-env.txt"), "utf8").trim(), "token=present");
     assert.equal(existsSync(join(fixture.root, "npm-hijacked")), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+
+test("agent service refuses symlinked PID and log state files", () => {
+  const fixture = createFixture();
+  try {
+    const target = join(fixture.home, "protected-target.txt");
+    const pidFile = join(fixture.home, ".codespace-agent.pid");
+    writeFileSync(target, "do-not-overwrite");
+    symlinkSync(target, pidFile);
+    const pidResult = runService(fixture, "start");
+    assert.equal(pidResult.status, 1, pidResult.stderr);
+    assert.match(pidResult.stderr, /symbolic-link agent state file/i);
+    assert.equal(readFileSync(target, "utf8"), "do-not-overwrite");
+    rmSync(pidFile);
+    const logFile = join(fixture.home, ".codespace-agent.log");
+    symlinkSync(target, logFile);
+    const logResult = runService(fixture, "start");
+    assert.equal(logResult.status, 1, logResult.stderr);
+    assert.match(logResult.stderr, /symbolic-link agent state file/i);
+    assert.equal(readFileSync(target, "utf8"), "do-not-overwrite");
+    rmSync(logFile);
+    const hardlinkPid = join(fixture.home, ".codespace-agent.pid");
+    const hardlinkTarget = join(fixture.home, "hardlink-target.txt");
+    writeFileSync(hardlinkTarget, "keep-this-content");
+    linkSync(hardlinkTarget, hardlinkPid);
+    const hardlinkResult = runService(fixture, "start");
+    assert.equal(hardlinkResult.status, 1, hardlinkResult.stderr);
+    assert.match(hardlinkResult.stderr, /hard-linked agent state file/i);
+    assert.equal(readFileSync(hardlinkTarget, "utf8"), "keep-this-content");
+    assert.equal(existsSync(join(fixture.root, "launched")), false);
   } finally {
     fixture.cleanup();
   }
