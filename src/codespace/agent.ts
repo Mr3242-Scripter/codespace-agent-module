@@ -687,7 +687,11 @@ export async function runCodespaceAgent(): Promise<void> {
         body: JSON.stringify({ codespace }),
         signal: AbortSignal.timeout(10_000)
       });
-      if (!response.ok) throw new Error(`Heartbeat failed: ${response.status}`);
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new Error(`Heartbeat failed: ${response.status}`);
+      }
+      await response.body?.cancel().catch(() => undefined);
     } catch (error) {
       if (!stopping) console.error("Codespaces agent heartbeat error:", error);
     } finally {
@@ -705,7 +709,10 @@ export async function runCodespaceAgent(): Promise<void> {
       if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
       backoff = 1000;
       const { job } = await readJsonLimited(poll) as { job: null | { id: string; operation: string; args: Record<string, any> } };
-      if (!job) continue;
+      if (!job) {
+        await delay(250);
+        continue;
+      }
       let value: unknown, ok = true;
       try { value = await execute(job.operation, job.args); }
       catch (error) { ok = false; value = error instanceof Error ? error.message : String(error); }

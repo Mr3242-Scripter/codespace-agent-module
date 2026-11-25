@@ -148,7 +148,7 @@ async function syncFiles(a: any) {
       const stat = await fs.stat(file);
       if (!stat.isFile()) throw new Error(`Download target is not a regular file: ${entry.path}`);
       if (stat.size > 1024 * 1024 || total + stat.size > 1024 * 1024) throw new Error("Batch sync exceeds 1 MiB; use resumable chunked transfer for larger files.");
-      const data = await fs.readFile(file);
+      const data = await readWorkspaceFileBounded(file, 1024 * 1024 - total);
       total += data.length;
       downloaded.push({ path: entry.path, contentBase64: data.toString("base64"), size: data.length });
     }
