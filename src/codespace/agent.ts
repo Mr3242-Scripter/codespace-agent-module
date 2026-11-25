@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createChildProcessEnv, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -587,27 +587,32 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "archive.extract": {
       const archive = resolvePath(a.archive), destination = resolvePath(a.destination);
       if (destination === root) throw new Error("Archive extraction cannot target the workspace root.");
-      const listing = await run("tar", ["-tvzf", archive]);
-      const limits = inspectArchiveListing(listing.stdout);
-      await fs.mkdir(path.dirname(destination), { recursive: true });
-      let destinationExists = false;
+
+      // Validate and extract the same private snapshot to prevent list/extract TOCTOU.
+      const snapshot = await createBoundedFileSnapshot(archive, 512 * 1024 * 1024);
       try {
-        const stat = await fs.lstat(destination);
-        if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Extraction destination must be a real directory, not a link or file.");
-        if ((await fs.readdir(destination)).length) throw new Error("Extraction destination must be empty to prevent overwriting existing files.");
-        destinationExists = true;
-      } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
-      const staging = path.join(path.dirname(destination), `.codespace-extract-${randomUUID()}`);
-      await fs.mkdir(staging, { recursive: false });
-      try {
-        await run("tar", ["--no-same-owner", "--no-same-permissions", "-xzf", archive, "-C", staging]);
-        if (destinationExists) await fs.rmdir(destination);
-        await fs.rename(staging, destination);
-      } catch (error) {
-        await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
-        throw error;
-      }
-      return { extracted: true, entries: limits.entries, uncompressedBytes: limits.uncompressedBytes, destination: path.relative(root, destination) };
+        const listing = await run("tar", ["-tvzf", snapshot.path]);
+        const limits = inspectArchiveListing(listing.stdout);
+        await fs.mkdir(path.dirname(destination), { recursive: true });
+        let destinationExists = false;
+        try {
+          const stat = await fs.lstat(destination);
+          if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Extraction destination must be a real directory, not a link or file.");
+          if ((await fs.readdir(destination)).length) throw new Error("Extraction destination must be empty to prevent overwriting existing files.");
+          destinationExists = true;
+        } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+        const staging = path.join(path.dirname(destination), `.codespace-extract-${randomUUID()}`);
+        await fs.mkdir(staging, { recursive: false });
+        try {
+          await run("tar", ["--no-same-owner", "--no-same-permissions", "-xzf", snapshot.path, "-C", staging]);
+          if (destinationExists) await fs.rmdir(destination);
+          await fs.rename(staging, destination);
+        } catch (error) {
+          await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
+          throw error;
+        }
+        return { extracted: true, entries: limits.entries, uncompressedBytes: limits.uncompressedBytes, destination: path.relative(root, destination) };
+      } finally { await snapshot.cleanup(); }
     }
     case "transfer.read": return { contentBase64: (await readFileBufferBounded(resolvePath(a.path), 512 * 1024)).toString("base64") };
     case "transfer.write": await fs.writeFile(resolvePath(a.path), Buffer.from(String(a.contentBase64), "base64")); return { written: true };
@@ -706,7 +711,10 @@ export async function runCodespaceAgent(): Promise<void> {
   while (!stopping) {
     try {
       const poll = await request(`${baseUrl}/codespaces/agent/poll?name=${encodeURIComponent(codespace)}`, { signal: AbortSignal.timeout(30_000) });
-      if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
+      if (!poll.ok) {
+        await poll.body?.cancel().catch(() => undefined);
+        throw new Error(`Poll failed: ${poll.status}`);
+      }
       backoff = 1000;
       const { job } = await readJsonLimited(poll) as { job: null | { id: string; operation: string; args: Record<string, any> } };
       if (!job) {
@@ -725,7 +733,10 @@ export async function runCodespaceAgent(): Promise<void> {
       for (let attempt=0; attempt<5 && !stopping; attempt++) {
         try {
           const response = await request(`${baseUrl}/codespaces/agent/result`, { method:"POST", body:resultBody });
-          if (!response.ok) throw new Error(`Result delivery failed: ${response.status}`);
+          if (!response.ok) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new Error(`Result delivery failed: ${response.status}`);
+          }
           const receipt = await readJsonLimited(response) as { accepted?: boolean };
           if (receipt.accepted !== true) throw new Error("Relay rejected or expired this job result.");
           delivered=true; break;

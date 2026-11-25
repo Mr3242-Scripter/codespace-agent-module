@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -186,5 +186,23 @@ test("bounded file reads preserve small files and reject oversized files", async
     await fs.writeFile(large, "0123456789");
     assert.equal(await readFileBounded(small, 5), "hello");
     await assert.rejects(readFileBounded(large, 5), /read limit.*chunked/i);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
+
+
+test("bounded file snapshots reject symlinks and oversized sources and preserve copied bytes", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-snapshot-test-"));
+  try {
+    const source = path.join(dir, "archive.tar.gz");
+    const link = path.join(dir, "archive-link.tar.gz");
+    await fs.writeFile(source, Buffer.from("stable archive bytes"));
+    const snapshot = await createBoundedFileSnapshot(source, 1024);
+    try {
+      assert.equal(await fs.readFile(snapshot.path, "utf8"), "stable archive bytes");
+      assert.notEqual(snapshot.path, source);
+    } finally { await snapshot.cleanup(); }
+    await fs.symlink(source, link);
+    await assert.rejects(createBoundedFileSnapshot(link, 1024));
+    await assert.rejects(createBoundedFileSnapshot(source, 4), /input limit/i);
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });

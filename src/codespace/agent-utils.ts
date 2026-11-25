@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
-import { lstatSync, realpathSync } from "node:fs";
+import { constants, lstatSync, realpathSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -157,6 +158,51 @@ export async function readFileBufferBounded(filePath: string, maxBytes: number):
     }
     return buffer.subarray(0, offset);
   } finally { await handle.close(); }
+}
+
+
+export async function createBoundedFileSnapshot(sourcePath: string, maxBytes: number): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const source = await fs.open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let directory: string | undefined;
+  try {
+    const before = await source.stat({ bigint: true });
+    if (!before.isFile()) throw new Error("Snapshot source must be a regular file.");
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || before.size > BigInt(maxBytes)) {
+      throw new Error(`Snapshot source exceeds the ${Math.floor(maxBytes / 1024 / 1024)} MiB input limit.`);
+    }
+    directory = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-agent-snapshot-"));
+    const snapshotPath = path.join(directory, "snapshot.bin");
+    const target = await fs.open(snapshotPath, "wx", 0o600);
+    try {
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      const expectedSize = Number(before.size);
+      let offset = 0;
+      while (offset < expectedSize) {
+        const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, expectedSize - offset), offset);
+        if (bytesRead === 0) throw new Error("Snapshot source changed or was truncated while being copied.");
+        let written = 0;
+        while (written < bytesRead) {
+          const result = await target.write(buffer, written, bytesRead - written, offset + written);
+          if (result.bytesWritten === 0) throw new Error("Could not complete the file snapshot.");
+          written += result.bytesWritten;
+        }
+        offset += bytesRead;
+      }
+      await target.sync();
+    } finally { await target.close(); }
+    const after = await source.stat({ bigint: true });
+    if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+      throw new Error("Snapshot source changed while it was being copied; retry with a stable file.");
+    }
+    const snapshotDirectory = directory;
+    return {
+      path: snapshotPath,
+      cleanup: async () => { await fs.rm(snapshotDirectory, { recursive: true, force: true }); }
+    };
+  } catch (error) {
+    if (directory) await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  } finally { await source.close(); }
 }
 
 export async function readFileBounded(filePath: string, maxBytes: number): Promise<string> {
