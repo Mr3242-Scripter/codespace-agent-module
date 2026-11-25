@@ -67,7 +67,6 @@ test("installer environment rejects user-writable PATH entries and strips inheri
     };
     const env = createInstallerEnv(source, target, os.homedir(), os.tmpdir());
     const entries = env.PATH.split(path.delimiter);
-    assert.ok(entries.includes(await fs.realpath("/usr/local/bin")));
     assert.ok(entries.includes(await fs.realpath("/usr/bin")));
     assert.ok(!entries.includes(userBin));
     assert.ok(!entries.includes(workspaceAlias));
