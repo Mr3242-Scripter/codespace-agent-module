@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -239,6 +239,19 @@ test("trusted executable resolution accepts only root-owned non-writable binarie
   const resolved = await resolveTrustedExecutable("python3", "/usr/bin", workspace, home, 0, temp);
   assert.equal(resolved, await fs.realpath("/usr/bin/python3"));
   await assert.rejects(resolveTrustedExecutable("this-command-should-not-exist", "/usr/bin", workspace, home, 0, temp), /root-owned system directories/);
+});
+
+test("no-follow writes reject symlink targets without modifying their referents", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-no-follow-write-"));
+  try {
+    const target = path.join(dir, "target.txt"), link = path.join(dir, "link.txt");
+    await fs.writeFile(target, "original");
+    await fs.symlink(target, link);
+    await assert.rejects(writeFileNoFollow(link, "attacker-controlled"));
+    assert.equal(await fs.readFile(target, "utf8"), "original");
+    await writeFileNoFollow(target, "updated");
+    assert.equal(await fs.readFile(target, "utf8"), "updated");
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
 
 test("bounded file reads preserve small files and reject oversized files", async () => {

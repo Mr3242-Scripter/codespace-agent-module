@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -188,7 +188,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "fs.write": {
       const file = resolvePath(a.path);
       if (a.createParents) await fs.mkdir(path.dirname(file), { recursive: true });
-      await fs.writeFile(file, String(a.content), "utf8"); return { written: true, path: file };
+      await writeFileNoFollow(file, String(a.content)); return { written: true, path: file };
     }
     case "fs.mkdir": await fs.mkdir(resolvePath(a.path), { recursive: true }); return { created: true };
     case "fs.copy": {
@@ -611,7 +611,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       } finally { await snapshot.cleanup(); }
     }
     case "transfer.read": return { contentBase64: (await readFileBufferBounded(resolvePath(a.path), 512 * 1024)).toString("base64") };
-    case "transfer.write": await fs.writeFile(resolvePath(a.path), Buffer.from(String(a.contentBase64), "base64")); return { written: true };
+    case "transfer.write": await writeFileNoFollow(resolvePath(a.path), Buffer.from(String(a.contentBase64), "base64")); return { written: true };
     default: throw new Error(`Unsupported agent operation: ${operation}`);
   }
 }

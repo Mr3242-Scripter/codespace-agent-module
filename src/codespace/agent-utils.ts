@@ -246,6 +246,15 @@ export function createGitHubCliEnv(source: NodeJS.ProcessEnv = process.env, work
   return env;
 }
 
+export async function writeFileNoFollow(filePath: string, data: string | Uint8Array, mode = 0o666): Promise<void> {
+  const handle = await fs.open(filePath, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("Write target must be a regular file.");
+    await handle.writeFile(data);
+  } finally { await handle.close(); }
+}
+
 export async function readFileBufferBounded(filePath: string, maxBytes: number): Promise<Buffer> {
   const handle = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {

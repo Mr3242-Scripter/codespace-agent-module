@@ -6,7 +6,7 @@ import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, resolveTrustedExecutable, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, resolveTrustedExecutable, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
@@ -111,7 +111,7 @@ async function applyEdits(a: any) {
     applied.push(edit.all ? occurrences : 1);
   }
   if (Buffer.byteLength(content,"utf8") > 10*1024*1024) throw new Error("Edited file exceeds 10 MiB.");
-  await fs.writeFile(file,content,"utf8");
+  await writeFileNoFollow(file,content);
   return { updated:true,path:path.relative(root,file),bytes:Buffer.byteLength(content),applied };
 }
 async function syncFiles(a: any) {
@@ -174,7 +174,7 @@ async function vscodeConfig(a: any) {
   if(Buffer.byteLength(a.content,"utf8")>512*1024)throw new Error("VS Code configuration content exceeds the 512 KiB limit.");
   JSON.parse(a.content);
   await fs.mkdir(dir,{recursive:true});
-  await fs.writeFile(file,a.content,"utf8");
+  await writeFileNoFollow(file,a.content);
   return { written:true,path:path.relative(root,file),bytes:Buffer.byteLength(a.content) };
 }
 
