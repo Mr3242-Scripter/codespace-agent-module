@@ -25,6 +25,7 @@ async function readWorkspaceFileBounded(file: string, maxBytes: number): Promise
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("Workspace read target must be a regular file.");
+    if (stat.nlink > 1) throw new Error("Hard-linked files cannot be read through the workspace agent.");
     if (stat.size > maxBytes) throw new Error(`Workspace file exceeds the ${Math.floor(maxBytes / 1024)} KiB read limit.`);
     const buffer = Buffer.alloc(stat.size);
     let offset = 0;
@@ -394,6 +395,7 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       try{
         const stat=await handle.stat();
         if(!stat.isFile())throw new Error("Download target must be a regular file.");
+        if(stat.nlink>1)throw new Error("Hard-linked files cannot be downloaded through the workspace agent.");
         if(offset>stat.size)throw new Error("offset exceeds file size.");
         const buffer=Buffer.alloc(Math.min(length,Math.max(0,stat.size-offset)));
         const read=buffer.length?await handle.read(buffer,0,buffer.length,offset):{bytesRead:0};

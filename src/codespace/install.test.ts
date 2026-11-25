@@ -63,7 +63,7 @@ test("installer environment rejects user-writable PATH entries and strips inheri
       GIT_ASKPASS: "/tmp/fake-askpass", AWS_SECRET_ACCESS_KEY: "aws-secret", AZURE_CLIENT_SECRET: "azure-secret",
       GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcp.json", NODE_OPTIONS: "--no-warnings", NODE_PATH: "/tmp/node-modules",
       GIT_CONFIG_COUNT: "1", GIT_SSH_COMMAND: "fake-ssh", DOCKER_HOST: "tcp://127.0.0.1:2375",
-      PYTHONPATH: "/tmp/python", GPG_AGENT_INFO: "/tmp/gpg-agent", SAFE_VALUE: "preserved"
+      PYTHONPATH: "/tmp/python", GPG_AGENT_INFO: "/tmp/gpg-agent", CDPATH: "/tmp", IFS: ":", GLOBIGNORE: "*", ZDOTDIR: "/tmp/zsh", 'BASH_FUNC_evil%%': "() { echo inherited; }", SAFE_VALUE: "preserved"
     };
     const env = createInstallerEnv(source, target, os.homedir(), os.tmpdir());
     const entries = env.PATH.split(path.delimiter);
@@ -73,7 +73,7 @@ test("installer environment rejects user-writable PATH entries and strips inheri
     assert.ok(!entries.includes("/usr/local/share/npm-global/bin"));
     assert.ok(!entries.includes(os.homedir()));
     assert.ok(!entries.includes(os.tmpdir()));
-    for (const name of ["CODESPACE_AGENT_TOKEN", "GITHUB_TOKEN", "GITHUB_CODESPACE_TOKEN", "GH_TOKEN", "NODE_AUTH_TOKEN", "NPM_TOKEN", "GIT_ASKPASS", "AWS_SECRET_ACCESS_KEY", "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "NODE_OPTIONS", "NODE_PATH", "GIT_CONFIG_COUNT", "GIT_SSH_COMMAND", "DOCKER_HOST", "PYTHONPATH", "GPG_AGENT_INFO"]) {
+    for (const name of ["CODESPACE_AGENT_TOKEN", "GITHUB_TOKEN", "GITHUB_CODESPACE_TOKEN", "GH_TOKEN", "NODE_AUTH_TOKEN", "NPM_TOKEN", "GIT_ASKPASS", "AWS_SECRET_ACCESS_KEY", "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "NODE_OPTIONS", "NODE_PATH", "GIT_CONFIG_COUNT", "GIT_SSH_COMMAND", "DOCKER_HOST", "PYTHONPATH", "GPG_AGENT_INFO", "CDPATH", "IFS", "GLOBIGNORE", "ZDOTDIR", "BASH_FUNC_evil%%"]) {
       assert.equal(env[name], undefined, name + " must be removed");
     }
     assert.equal(env.SAFE_VALUE, "preserved");

@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
+import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -221,7 +221,10 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "fs.chmod": {
       const mode = Number(a.mode);
       if (!Number.isInteger(mode) || mode < 0 || mode > 0o777) throw new Error("mode must be a valid permission integer (0-511).");
-      await fs.chmod(resolvePath(a.path), mode); return { changed: true, mode: mode.toString(8) };
+      const target = resolvePath(a.path);
+      const stat = await fs.lstat(target);
+      if (stat.isFile() && stat.nlink > 1) throw new Error("Hard-linked files cannot be chmodded through the workspace agent.");
+      await fs.chmod(target, mode); return { changed: true, mode: mode.toString(8) };
     }
     case "fs.write": {
       const file = resolvePath(a.path);
@@ -231,7 +234,9 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "fs.mkdir": await fs.mkdir(resolvePath(a.path), { recursive: true }); return { created: true };
     case "fs.copy": {
       const from = resolvePath(a.from), to = resolvePath(a.to);
+      await assertNoHardLinksInTree(from);
       if (!a.overwrite) { try { await fs.access(to); throw new Error("Destination already exists."); } catch (e: any) { if (e?.code !== "ENOENT") throw e; } }
+      else await assertNoHardLinksInTree(to).catch((error: any) => { if (error?.code !== "ENOENT") throw error; });
       await fs.cp(from, to, { recursive: Boolean(a.recursive), force: Boolean(a.overwrite), errorOnExist: !a.overwrite, dereference: false });
       return { copied: true };
     }
@@ -639,7 +644,11 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
         socket.once("error", error => finish(false, error.message));
       });
     }
-    case "archive.create": return run("tar", ["-czf", resolvePath(a.output), "-C", path.dirname(resolvePath(a.path)), path.basename(resolvePath(a.path))]);
+    case "archive.create": {
+      const source = resolvePath(a.path);
+      await assertNoHardLinksInTree(source);
+      return run("tar", ["-czf", resolvePath(a.output), "-C", path.dirname(source), path.basename(source)]);
+    }
     case "archive.extract": {
       const archive = resolvePath(a.archive), destination = resolvePath(a.destination);
       if (destination === root) throw new Error("Archive extraction cannot target the workspace root.");

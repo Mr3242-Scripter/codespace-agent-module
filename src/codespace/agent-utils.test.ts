@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -198,7 +198,7 @@ test("untrusted child process environments remove generic, cloud, SSH, and GitHu
     GIT_SSH_COMMAND: "evil-ssh", npm_config_userconfig: "/tmp/npmrc",
     PYTHONPATH: "/tmp/python", JAVA_TOOL_OPTIONS: "-javaagent:/tmp/evil.jar",
     GIT_EXEC_PATH: "/tmp/git-exec", GIT_DIR: "/tmp/attacker.git",
-    DOCKER_HOST: "tcp://127.0.0.1:2375", GPG_AGENT_INFO: "/tmp/gpg-agent", OTHER_VALUE: "keep-me"
+    DOCKER_HOST: "tcp://127.0.0.1:2375", GPG_AGENT_INFO: "/tmp/gpg-agent", CDPATH: "/tmp", IFS: ":", GLOBIGNORE: "*", ZDOTDIR: "/tmp/zsh", 'BASH_FUNC_evil%%': "() { echo inherited; }", OTHER_VALUE: "keep-me"
   };
   const child = createChildProcessEnv(source);
   assert.equal(child.PATH, "/usr/bin");
@@ -265,6 +265,11 @@ test("no-follow writes reject symlink targets without modifying their referents"
     assert.equal(await fs.readFile(target, "utf8"), "original");
     await writeFileNoFollow(target, "updated");
     assert.equal(await fs.readFile(target, "utf8"), "updated");
+    const external = path.join(dir, "external-secret.txt"), hardlink = path.join(dir, "workspace-hardlink.txt");
+    await fs.writeFile(external, "secret-content");
+    await fs.link(external, hardlink);
+    await assert.rejects(writeFileNoFollow(hardlink, "overwrite"), /Hard-linked files/);
+    assert.equal(await fs.readFile(external, "utf8"), "secret-content");
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
 
@@ -279,6 +284,9 @@ test("bounded file reads preserve small files and reject oversized files", async
     const link = path.join(dir, "small-link.txt");
     await fs.symlink(small, link);
     await assert.rejects(readFileBounded(link, 5), /symbolic link|too many levels|eloop/i);
+    const hardlink = path.join(dir, "small-hardlink.txt");
+    await fs.link(small, hardlink);
+    await assert.rejects(readFileBounded(hardlink, 5), /Hard-linked files/);
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
 
@@ -296,6 +304,10 @@ test("bounded file snapshots reject symlinks and oversized sources and preserve 
     } finally { await snapshot.cleanup(); }
     await fs.symlink(source, link);
     await assert.rejects(createBoundedFileSnapshot(link, 1024));
+    const hardlink = path.join(dir, "archive-hardlink.tar.gz");
+    await fs.link(source, hardlink);
+    await assert.rejects(createBoundedFileSnapshot(hardlink, 1024), /Hard-linked files/);
+    await fs.unlink(hardlink);
     await assert.rejects(createBoundedFileSnapshot(source, 4), /input limit/i);
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
@@ -341,4 +353,25 @@ test("Git tag arguments reject option-like names and control characters", () => 
   assert.throws(() => validateGitTagArgument("--help"), /Invalid Git tag/);
   assert.throws(() => validateGitTagArgument(""), /Invalid Git tag/);
   assert.throws(() => validateGitTagArgument("bad\ntag"), /Invalid Git tag/);
+});
+
+
+test("workspace content operations reject hard links without following symlinks", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-hardlink-tree-"));
+  try {
+    const root = path.join(dir, "workspace");
+    const external = path.join(dir, "outside-secret.txt");
+    await fs.mkdir(path.join(root, "nested"), { recursive: true });
+    await fs.writeFile(external, "outside-secret");
+    await fs.writeFile(path.join(root, "nested", "ordinary.txt"), "ordinary");
+    await assert.doesNotReject(assertNoHardLinksInTree(root));
+    const hardlink = path.join(root, "nested", "linked-secret.txt");
+    await fs.link(external, hardlink);
+    await assert.rejects(assertNoHardLinksInTree(root), /Hard-linked files/);
+    await fs.unlink(hardlink);
+    const linkTarget = path.join(dir, "symlink-target.txt");
+    await fs.writeFile(linkTarget, "not traversed");
+    await fs.symlink(linkTarget, path.join(root, "nested", "external-link.txt"));
+    await assert.doesNotReject(assertNoHardLinksInTree(root));
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });

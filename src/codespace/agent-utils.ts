@@ -210,7 +210,7 @@ export function assertProtocolQueueCapacity(queuedBytes: number, messageBytes: n
 
 const SENSITIVE_ENV_NAME = /(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|KEY|COOKIE|AUTH|CREDENTIAL|CERT|PRIVATE|SESSION|ASKPASS|ACCESS|AGENT|SOCKET)/i;
 const CLOUD_CREDENTIAL_ENV_NAME = /^(?:AWS_|AZURE_|ARM_|GOOGLE_|GCLOUD_|CLOUDSDK_|GCP_|VAULT_|TF_VAR_|KUBECONFIG$|DOCKER_CONFIG$)/i;
-const EXECUTION_ENV_NAME = /^(?:NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|LD_.*|DYLD_.*|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|GIT_.*|DOCKER_HOST|DOCKER_CONTEXT|CONTAINER_HOST|COREPACK_.*|NPM_CONFIG_.*|npm_config_.*)$/i;
+const EXECUTION_ENV_NAME = /^(?:NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|BASH_FUNC_.*|CDPATH|IFS|GLOBIGNORE|ZDOTDIR|LD_.*|DYLD_.*|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|GIT_.*|DOCKER_HOST|DOCKER_CONTEXT|CONTAINER_HOST|COREPACK_.*|NPM_CONFIG_.*|npm_config_.*)$/i;
 
 export function createChildProcessEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env = { ...source };
@@ -297,12 +297,58 @@ export function createGitHubCliEnv(source: NodeJS.ProcessEnv = process.env, work
 }
 
 export async function writeFileNoFollow(filePath: string, data: string | Uint8Array, mode = 0o666): Promise<void> {
-  const handle = await fs.open(filePath, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
+  let targetMode = mode;
   try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("Write target must be a regular file.");
+    const existing = await fs.lstat(filePath);
+    if (existing.isSymbolicLink() || !existing.isFile()) throw new Error("Write target must be a regular file, not a link or special file.");
+    if (existing.nlink > 1) throw new Error("Hard-linked files cannot be overwritten through the workspace agent.");
+    targetMode = existing.mode & 0o777;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const temporary = path.join(path.dirname(filePath), `.codespace-agent-${randomUUID()}.write`);
+  const handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK, targetMode);
+  try {
     await handle.writeFile(data);
-  } finally { await handle.close(); }
+    await handle.sync();
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await fs.unlink(temporary).catch(() => undefined);
+    throw error;
+  }
+  await handle.close();
+  try {
+    try {
+      const current = await fs.lstat(filePath);
+      if (current.isSymbolicLink() || !current.isFile()) throw new Error("Write target changed to a link or special file during the write.");
+      if (current.nlink > 1) throw new Error("Hard-linked files cannot be overwritten through the workspace agent.");
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await fs.rename(temporary, filePath);
+  } catch (error) {
+    await fs.unlink(temporary).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function assertNoHardLinksInTree(targetPath: string, maxEntries = 10_000): Promise<void> {
+  let visited = 0;
+  async function walk(target: string): Promise<void> {
+    const stat = await fs.lstat(target);
+    if (stat.isSymbolicLink()) return;
+    if (stat.isFile()) {
+      if (stat.nlink > 1) throw new Error(`Hard-linked files are not permitted in workspace content operations: ${target}`);
+      return;
+    }
+    if (!stat.isDirectory()) throw new Error(`Special filesystem entries are not permitted in workspace content operations: ${target}`);
+    const directory = await fs.opendir(target);
+    for await (const entry of directory) {
+      if (++visited > maxEntries) throw new Error(`Filesystem content operation exceeds the ${maxEntries}-entry hard-link validation limit.`);
+      await walk(path.join(target, entry.name));
+    }
+  }
+  await walk(path.resolve(targetPath));
 }
 
 export async function readFileBufferBounded(filePath: string, maxBytes: number): Promise<Buffer> {
@@ -310,6 +356,7 @@ export async function readFileBufferBounded(filePath: string, maxBytes: number):
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("Target must be a regular file.");
+    if (stat.nlink > 1) throw new Error("Hard-linked files cannot be read through the workspace agent.");
     if (stat.size > maxBytes) throw new Error("File exceeds the " + Math.floor(maxBytes / 1024) + " KiB read limit; use chunked transfer.download.chunk instead.");
     const buffer = Buffer.alloc(stat.size);
     let offset = 0;
@@ -329,6 +376,7 @@ export async function createBoundedFileSnapshot(sourcePath: string, maxBytes: nu
   try {
     const before = await source.stat({ bigint: true });
     if (!before.isFile()) throw new Error("Snapshot source must be a regular file.");
+    if (before.nlink > 1n) throw new Error("Hard-linked files cannot be snapshotted through the workspace agent.");
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || before.size > BigInt(maxBytes)) {
       throw new Error(`Snapshot source exceeds the ${Math.floor(maxBytes / 1024 / 1024)} MiB input limit.`);
     }
