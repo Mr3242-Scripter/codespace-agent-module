@@ -66,6 +66,16 @@ Required system executables: Python 3, pip, Git, Docker CLI, GitHub CLI (`gh`), 
 
 **PTY is mandatory.** `node-pty` is loaded as a required module during agent startup. Terminal sessions use PTY mode and there is no pipe-based terminal fallback. Non-terminal process sessions continue to use ordinary pipes.
 
+
+## Security limits
+
+- The relay URL must use HTTPS. Plain HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1` development endpoints.
+- Archive extraction rejects links, special files, absolute/traversal paths, archives over 10,000 entries, files over 128 MiB, and total uncompressed content over 512 MiB. Extraction uses a fresh staging directory and requires an empty destination.
+- Resumable uploads are limited to 256 MiB per transfer and 512 MiB reserved across all active transfers (20 sessions maximum).
+- Process signalling is restricted to PIDs belonging to sessions started and tracked by this agent.
+- Relay requests have a 30-second timeout; JSON relay responses are capped at 1 MiB.
+- Workspace path validation rejects symlink components, including symlinks that resolve back inside the workspace. Avoid allowing untrusted concurrent processes to mutate workspace directory entries while the agent is operating; Node's path-based filesystem APIs cannot provide a complete `openat2`-style race-free guarantee across every operation.
+
 ## Commands
 
 After installation:

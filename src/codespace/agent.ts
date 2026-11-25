@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { matchesFilenamePattern, pruneEndedSessions } from "./agent-utils.js";
+import { assertNoSymlinkComponents, inspectArchiveListing, matchesFilenamePattern, pruneEndedSessions, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -17,8 +17,7 @@ const ptyModule = localRequire("node-pty");
 const baseUrl = (process.env.CODESPACE_AGENT_URL ?? "").replace(/\/+$/, "");
 const token = process.env.CODESPACE_AGENT_TOKEN ?? "";
 const codespace = process.env.CODESPACE_NAME ?? "";
-const root = path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd());
-const rootReal = realpathSync(root);
+const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
 type Session = { child: any; output: string; ended: boolean; endedAt: number | null; exitCode: number | null; command: string; createdAt: string; pty: boolean };
 const sessions = new Map<string, Session>();
 function startSession(command: string, cwd = root, usePty = false) {
@@ -66,19 +65,7 @@ function readSession(id: string, clear = false) {
 function resolvePath(input = "."): string {
   const resolved = path.resolve(root, input);
   if (resolved !== root && !resolved.startsWith(root + path.sep)) throw new Error("Path escapes the workspace root.");
-  let probe = resolved;
-  while (true) {
-    try {
-      const actual = realpathSync(probe);
-      if (actual !== rootReal && !actual.startsWith(rootReal + path.sep)) throw new Error("Symlink resolves outside the workspace root.");
-      break;
-    } catch (error: any) {
-      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
-      const parent = path.dirname(probe);
-      if (parent === probe) throw error;
-      probe = parent;
-    }
-  }
+  assertNoSymlinkComponents(root, resolved);
   return resolved;
 }
 async function resolveExecutable(command: string): Promise<string> {
@@ -277,16 +264,18 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "process.kill": {
       const pid = Number(a.pid);
       if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) throw new Error("Refusing to signal a protected or invalid PID.");
-      const session = [...sessions.values()].find(item => Number(item.child.pid) === pid);
-      if (session) signalSession(session, "SIGTERM"); else process.kill(pid, "SIGTERM");
+      const session = requireTrackedSession(sessions, pid);
+      if (session.ended) return { signalled: false, alreadyEnded: true, pid };
+      signalSession(session, "SIGTERM");
       return { signalled: true, pid, signal: "SIGTERM" };
     }
     case "process.signal": {
       const pid = Number(a.pid), signal = String(a.signal ?? "SIGTERM");
       if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) throw new Error("Refusing to signal a protected or invalid PID.");
       if (!["SIGINT", "SIGTERM", "SIGHUP", "SIGKILL", "SIGUSR1", "SIGUSR2"].includes(signal)) throw new Error("Unsupported process signal.");
-      const session = [...sessions.values()].find(item => Number(item.child.pid) === pid);
-      if (session) signalSession(session, signal as NodeJS.Signals); else process.kill(pid, signal as NodeJS.Signals);
+      const session = requireTrackedSession(sessions, pid);
+      if (session.ended) return { signalled: false, alreadyEnded: true, pid };
+      signalSession(session, signal as NodeJS.Signals);
       return { signalled: true, pid, signal };
     }
     case "git.status": return run("git", ["status", "--short", "--branch"], a.cwd ? resolvePath(a.cwd) : root);
@@ -558,13 +547,28 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "archive.create": return run("tar", ["-czf", resolvePath(a.output), "-C", path.dirname(resolvePath(a.path)), path.basename(resolvePath(a.path))]);
     case "archive.extract": {
       const archive = resolvePath(a.archive), destination = resolvePath(a.destination);
+      if (destination === root) throw new Error("Archive extraction cannot target the workspace root.");
       const listing = await run("tar", ["-tvzf", archive]);
-      const entries = listing.stdout.split(/\r?\n/).filter(Boolean);
-      if (entries.some(entry => /^[lh]/.test(entry) || entry.includes("../") || entry.includes("..\\\\") || entry.includes("/..") || entry.includes("\\.."))) {
-        throw new Error("Archive contains a link or unsafe path.");
+      const limits = inspectArchiveListing(listing.stdout);
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      let destinationExists = false;
+      try {
+        const stat = await fs.lstat(destination);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Extraction destination must be a real directory, not a link or file.");
+        if ((await fs.readdir(destination)).length) throw new Error("Extraction destination must be empty to prevent overwriting existing files.");
+        destinationExists = true;
+      } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+      const staging = path.join(path.dirname(destination), `.codespace-extract-${randomUUID()}`);
+      await fs.mkdir(staging, { recursive: false });
+      try {
+        await run("tar", ["--no-same-owner", "--no-same-permissions", "-xzf", archive, "-C", staging]);
+        if (destinationExists) await fs.rmdir(destination);
+        await fs.rename(staging, destination);
+      } catch (error) {
+        await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
       }
-      await fs.mkdir(destination, { recursive: true });
-      return run("tar", ["--no-same-owner", "--no-same-permissions", "-xzf", archive, "-C", destination]);
+      return { extracted: true, entries: limits.entries, uncompressedBytes: limits.uncompressedBytes, destination: path.relative(root, destination) };
     }
     case "transfer.read": return { contentBase64: (await fs.readFile(resolvePath(a.path))).toString("base64") };
     case "transfer.write": await fs.writeFile(resolvePath(a.path), Buffer.from(String(a.contentBase64), "base64")); return { written: true };
@@ -592,13 +596,40 @@ function parseDebugMessages(session: DebugSession): void {
     if (session.messages.length > 500) session.messages.shift();
   }
 }
+const MAX_RELAY_RESPONSE_BYTES = 1024 * 1024;
+async function readJsonLimited(response: Response): Promise<any> {
+  const declared = Number(response.headers.get("content-length") ?? 0);
+  if (declared > MAX_RELAY_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error("Relay response exceeds the 1 MiB limit.");
+  }
+  if (!response.body) throw new Error("Relay response body is empty.");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_RELAY_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new Error("Relay response exceeds the 1 MiB limit.");
+      }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const body = Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString("utf8");
+  return JSON.parse(body);
+}
 async function request(url: string, init: RequestInit = {}) {
-  return fetch(url, { ...init, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...init.headers } });
+  return fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(30_000), headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...init.headers } });
 }
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 let stopping = false;
 export async function runCodespaceAgent(): Promise<void> {
   if (!baseUrl || !token || token.length < 32 || !codespace) throw new Error("Set CODESPACE_AGENT_URL, CODESPACE_AGENT_TOKEN (32+ chars), and CODESPACE_NAME.");
+  validateRelayUrl(baseUrl);
   const stop = () => { stopping = true; };
   process.once("SIGINT", stop); process.once("SIGTERM", stop);
   console.log(`Codespaces agent connected for ${codespace}; workspace ${root}`);
@@ -626,10 +657,10 @@ export async function runCodespaceAgent(): Promise<void> {
   try {
   while (!stopping) {
     try {
-      const poll = await request(`${baseUrl}/codespaces/agent/poll?name=${encodeURIComponent(codespace)}`);
+      const poll = await request(`${baseUrl}/codespaces/agent/poll?name=${encodeURIComponent(codespace)}`, { signal: AbortSignal.timeout(30_000) });
       if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
       backoff = 1000;
-      const { job } = await poll.json() as { job: null | { id: string; operation: string; args: Record<string, any> } };
+      const { job } = await readJsonLimited(poll) as { job: null | { id: string; operation: string; args: Record<string, any> } };
       if (!job) continue;
       let value: unknown, ok = true;
       try { value = await execute(job.operation, job.args); }
@@ -639,7 +670,7 @@ export async function runCodespaceAgent(): Promise<void> {
         try {
           const response = await request(`${baseUrl}/codespaces/agent/result`, { method:"POST", body:JSON.stringify({id:job.id,codespace,ok,value}) });
           if (!response.ok) throw new Error(`Result delivery failed: ${response.status}`);
-          const receipt = await response.json() as { accepted?: boolean };
+          const receipt = await readJsonLimited(response) as { accepted?: boolean };
           if (receipt.accepted !== true) throw new Error("Relay rejected or expired this job result.");
           delivered=true; break;
         } catch (error) {

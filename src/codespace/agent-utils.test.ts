@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { isExpired, matchesFilenamePattern, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertUploadCapacity, inspectArchiveListing, isExpired, matchesFilenamePattern, pruneEndedSessions, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -79,4 +79,57 @@ test("batch upload rejects duplicate destinations before writing", async () => {
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+
+test("relay URLs require HTTPS except for loopback development", () => {
+  assert.doesNotThrow(() => validateRelayUrl("https://relay.example.test"));
+  assert.doesNotThrow(() => validateRelayUrl("http://localhost:3000"));
+  assert.doesNotThrow(() => validateRelayUrl("http://127.0.0.1:3000"));
+  assert.throws(() => validateRelayUrl("http://relay.example.test"), /must use HTTPS/i);
+  assert.throws(() => validateRelayUrl("https://user:pass@relay.example.test"), /embedded credentials/i);
+  assert.throws(() => validateRelayUrl("not a URL"), /valid HTTPS URL/i);
+});
+
+test("workspace path validation rejects symlinks, including links that stay inside the workspace", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-path-"));
+  try {
+    const real = path.join(dir, "real");
+    const link = path.join(dir, "link");
+    await fs.mkdir(real);
+    await fs.symlink(real, link, "dir");
+    assert.doesNotThrow(() => assertNoSymlinkComponents(dir, path.join(dir, "real", "file.txt")));
+    assert.throws(() => assertNoSymlinkComponents(dir, path.join(link, "file.txt")), /symbolic links/i);
+    assert.throws(() => assertNoSymlinkComponents(dir, path.join(dir, "..", "outside")), /escapes/i);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("archive validation enforces entry types, paths, file sizes, and aggregate expansion", () => {
+  const valid = "-rw-r--r-- node/node 5 2026-11-25 01:38 file.txt\ndrwxr-xr-xr-x node/node 0 2026-11-25 01:38 folder/";
+  assert.deepEqual(inspectArchiveListing(valid), { entries: 2, uncompressedBytes: 5 });
+  assert.throws(() => inspectArchiveListing("lrwxrwxrwx node/node 0 2026-11-25 01:38 link -> /tmp"), /links and special/i);
+  assert.throws(() => inspectArchiveListing("-rw-r--r-- node/node 5 2026-11-25 01:38 ../escape"), /absolute or traversal/i);
+  assert.throws(() => inspectArchiveListing("-rw-r--r-- node/node 11 2026-11-25 01:38 big.bin", 10, 10, 100), /per-file limit/i);
+  assert.throws(() => inspectArchiveListing(valid, 10, 10, 4), /total uncompressed-size limit/i);
+});
+
+test("upload reservations enforce per-file, session-count, and aggregate caps", () => {
+  const sessions = new Map<string, { expectedSize: number }>();
+  assert.doesNotThrow(() => assertUploadCapacity(sessions, 256, 2, 300, 512));
+  sessions.set("one", { expectedSize: 300 });
+  assert.doesNotThrow(() => assertUploadCapacity(sessions, 200, 2, 300, 512));
+  assert.throws(() => assertUploadCapacity(sessions, 256, 2, 300, 512), /aggregate active upload/i);
+  assert.throws(() => assertUploadCapacity(sessions, 301, 2, 300, 512), /expectedSize/i);
+  sessions.set("two", { expectedSize: 1 });
+  assert.throws(() => assertUploadCapacity(sessions, 1, 2, 300, 512), /session limit/i);
+});
+
+
+test("process signalling can resolve only a live PID owned by a tracked agent session", () => {
+  const owned = { child: { pid: 4242 }, ended: false };
+  const sessions = new Map([["owned", owned]]);
+  assert.equal(requireTrackedSession(sessions, 4242), owned);
+  assert.throws(() => requireTrackedSession(sessions, 4343), /tracked by this agent/i);
 });

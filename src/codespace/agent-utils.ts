@@ -1,6 +1,68 @@
 import fs from "node:fs/promises";
+import { lstatSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+
+export function validateRelayUrl(value: string): void {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("CODESPACE_AGENT_URL must be a valid HTTPS URL."); }
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error("CODESPACE_AGENT_URL must use HTTPS; plain HTTP is permitted only for localhost development.");
+  }
+  if (url.username || url.password) throw new Error("CODESPACE_AGENT_URL must not contain embedded credentials.");
+}
+
+export function assertNoSymlinkComponents(rootPath: string, targetPath: string): void {
+  const root = realpathSync(rootPath);
+  const target = path.resolve(targetPath);
+  if (target !== root && !target.startsWith(root + path.sep)) throw new Error("Path escapes the workspace root.");
+  let probe = root;
+  for (const part of path.relative(root, target).split(path.sep).filter(Boolean)) {
+    probe = path.join(probe, part);
+    try {
+      if (lstatSync(probe).isSymbolicLink()) throw new Error("Symbolic links are not permitted in workspace paths.");
+    } catch (error: any) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") break;
+      throw error;
+    }
+  }
+}
+
+export function inspectArchiveListing(listing: string, maxEntries = 10_000, maxFileBytes = 128 * 1024 * 1024, maxTotalBytes = 512 * 1024 * 1024): { entries: number; uncompressedBytes: number } {
+  const lines = listing.split(/\r?\n/).filter(Boolean);
+  if (lines.length > maxEntries) throw new Error(`Archive exceeds the ${maxEntries.toLocaleString()}-entry extraction limit.`);
+  let uncompressedBytes = 0;
+  for (const line of lines) {
+    const match = line.match(/^([bcdhlps-])\S*\s+\S+\s+(\d+)\s+\S+\s+\S+\s+(.+)$/);
+    if (!match) throw new Error("Archive listing contains an unsupported or unparseable entry.");
+    const [, kind, rawSize, name] = match;
+    if (kind !== "-" && kind !== "d") throw new Error("Archive links and special files are not permitted.");
+    const normalized = name.replace(/\\/g, "/");
+    if (normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.split("/").some(part => part === "..")) {
+      throw new Error("Archive contains an absolute or traversal path.");
+    }
+    const size = Number(rawSize);
+    if (!Number.isSafeInteger(size) || size < 0 || size > maxFileBytes) throw new Error(`Archive contains a file larger than the ${Math.floor(maxFileBytes / 1024 / 1024)} MiB per-file limit.`);
+    uncompressedBytes += size;
+    if (uncompressedBytes > maxTotalBytes) throw new Error(`Archive exceeds the ${Math.floor(maxTotalBytes / 1024 / 1024)} MiB total uncompressed-size limit.`);
+  }
+  return { entries: lines.length, uncompressedBytes };
+}
+
+
+export function requireTrackedSession<T extends { child: { pid?: number }; ended: boolean }>(sessions: Map<string, T>, pid: number): T {
+  const session = [...sessions.values()].find(item => Number(item.child.pid) === pid);
+  if (!session) throw new Error("Only processes started and tracked by this agent can be signalled.");
+  return session;
+}
+
+export function assertUploadCapacity<T extends { expectedSize: number }>(sessions: Map<string, T>, expectedSize: number, maxSessions: number, maxSingleBytes: number, maxAggregateBytes: number): void {
+  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > maxSingleBytes) throw new Error(`expectedSize must be between 0 and ${Math.floor(maxSingleBytes / 1024 / 1024)} MiB.`);
+  if (sessions.size >= maxSessions) throw new Error(`Upload session limit reached (${maxSessions} active uploads); expired sessions are cleaned automatically.`);
+  const reserved = [...sessions.values()].reduce((total, session) => total + session.expectedSize, 0);
+  if (reserved + expectedSize > maxAggregateBytes) throw new Error(`Aggregate active upload reservation limit reached (${Math.floor(maxAggregateBytes / 1024 / 1024)} MiB). Commit or abort another upload before starting this one.`);
+}
 
 export function matchesFilenamePattern(value: string, pattern: string): boolean {
   const normalizedPattern = pattern.replace(/\\/g, "/");

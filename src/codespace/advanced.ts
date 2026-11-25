@@ -6,29 +6,16 @@ import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { isExpired, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertUploadCapacity, isExpired, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
-const root = path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd());
-const rootReal = realpathSync(root);
+const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
 const startedAt = Date.now();
 
 function safePath(input = "."): string {
   const target = path.resolve(root, input);
   if (target !== root && !target.startsWith(root + path.sep)) throw new Error("Path escapes the workspace root.");
-  let probe = target;
-  while (true) {
-    try {
-      const actual = realpathSync(probe);
-      if (actual !== rootReal && !actual.startsWith(rootReal + path.sep)) throw new Error("Symlink resolves outside the workspace root.");
-      break;
-    } catch (error: any) {
-      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
-      const parent = path.dirname(probe);
-      if (parent === probe) throw error;
-      probe = parent;
-    }
-  }
+  assertNoSymlinkComponents(root, target);
   return target;
 }
 async function command(bin: string, args: string[], timeout = 15000) {
@@ -163,6 +150,9 @@ const watchSessions = new Map<string,WatchSession>();
 type TransferSession = { path:string; tempPath:string; expectedSize:number; received:number; lastActivityAt:number };
 const uploadTransfers = new Map<string,TransferSession>();
 const UPLOAD_TTL_MS = 15 * 60_000;
+const MAX_UPLOAD_SESSIONS = 20;
+const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
+const MAX_AGGREGATE_UPLOAD_BYTES = 512 * 1024 * 1024;
 async function cleanupExpiredUploads(now = Date.now()): Promise<number> {
   let removed = 0;
   for (const [id, session] of uploadTransfers) {
@@ -300,12 +290,11 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
     }
     case "transfer.upload.begin": {
       await cleanupExpiredUploads();
-      if(uploadTransfers.size>=20)throw new Error("Upload session limit reached (20 active uploads); expired sessions are cleaned automatically.");
       if(a.confirm!==true)throw new Error("Starting an upload requires confirm=true.");
       const target=safePath(String(a.path));
       if(target===root)throw new Error("Cannot upload over the workspace root.");
       const expectedSize=Number(a.expectedSize);
-      if(!Number.isSafeInteger(expectedSize)||expectedSize<0||expectedSize>1024*1024*1024)throw new Error("expectedSize must be between 0 and 1 GiB.");
+      assertUploadCapacity(uploadTransfers,expectedSize,MAX_UPLOAD_SESSIONS,MAX_UPLOAD_BYTES,MAX_AGGREGATE_UPLOAD_BYTES);
       if(a.overwrite!==true){try{await fs.access(target);throw new Error("Destination already exists; set overwrite=true to replace it.");}catch(error:any){if(error?.code!=="ENOENT")throw error;}}
       await fs.mkdir(path.dirname(target),{recursive:true});
       const id=randomUUID(), tempPath=path.join(path.dirname(target),`.${path.basename(target)}.codespace-${id}.upload`);
