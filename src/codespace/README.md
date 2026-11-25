@@ -74,16 +74,16 @@ Required system executables: Python 3, pip, Git, Docker CLI, GitHub CLI (`gh`), 
 - Resumable uploads are limited to 256 MiB per transfer and 512 MiB reserved across all active transfers (20 sessions maximum).
 - Process signalling is restricted to PIDs belonging to sessions started and tracked by this agent.
 - Workspace task discovery reads the root Makefile as bounded text and parses target declarations statically; it never invokes the make executable or evaluates Makefile functions while listing tasks.
-- Untrusted child processes have credential and code-injection environment variables stripped. Internal system commands resolve only to executables in root-owned, non-writable system paths; fixed GitHub CLI operations receive a scoped GH_TOKEN.
+- Untrusted child processes and installer/service verification subprocesses have credential, cloud, SSH/Git, npm-config, and code-injection environment variables stripped. Dev Container dependency installation runs with a clean environment and no user npm config. Internal system commands resolve only to executables in root-owned, non-writable system paths; fixed GitHub CLI operations receive a scoped GH_TOKEN.
 - Relay requests have a 30-second timeout; JSON relay responses are capped at 1 MiB and outbound job results at 900 KiB.
 - `fs.read` and legacy `transfer.read` are limited to 512 KiB; larger files must use chunked downloads. Directory listings are limited to 1,000 entries. Filesystem search scans at most 1,000 files / 16 MiB across 5,000 entries and skips individual files larger than 1 MiB; filename globs are limited to eight wildcard tokens to bound regex work.
 - LSP and DAP queues are limited to 8 MiB of accounted message storage and 4,096 messages; each queued message accounts for at least 256 bytes of overhead.
 - Workspace path validation rejects symlink components, including symlinks that resolve back inside the workspace. Directory listing and stat operations use `lstat` so symlink metadata is not followed. Path-based filesystem operations still cannot provide a complete `openat2`-style race-free guarantee if an untrusted process concurrently replaces parent directories; isolate the agent from untrusted concurrent workspace writers.
-- LSP and DAP transports cap message headers, receive buffers, queued message bytes, and pending input writes; sessions exceeding those limits are terminated or rejected.
+- LSP and DAP transports cap headers at 8 KiB, messages at 8 MiB, receive buffers, queued message bytes, and pending input writes; incomplete oversized headers are rejected immediately.
 - Forwarded-port checks are restricted to localhost and loopback IP addresses. Changing a forwarded port to `public` requires explicit `confirm: true`.
 - Resumable uploads without overwrite permission use an atomic same-filesystem no-replace link at commit time, preventing a destination created after upload start from being overwritten.
 - Process listing and inspection omit raw command-line arguments to reduce accidental disclosure of credentials passed through process arguments.
-- The portable installer rejects symlinked destination paths and uses exclusive payload copies and atomic configuration writes.
+- The portable installer canonicalizes PATH entries before excluding workspace shims, rejects symlinked destination paths, uses exclusive payload copies and atomic configuration writes, and strips inherited credentials before npm lifecycle scripts.
 
 ## Commands
 

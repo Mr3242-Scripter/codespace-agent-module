@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,16 +14,18 @@ function createFixture() {
   const script = join(root, "src/codespace/agent-service.sh");
   const bin = join(parent, "bin");
   const home = join(parent, "home");
+  const workspaceBinAlias = join(parent, "workspace-bin-alias");
   mkdirSync(join(root, "src/codespace"), { recursive: true });
   mkdirSync(join(root, "node_modules/@types/node"), { recursive: true });
   mkdirSync(join(root, "node_modules/.bin"), { recursive: true });
   mkdirSync(bin, { recursive: true });
   mkdirSync(home, { recursive: true });
+  symlinkSync(join(root, "node_modules/.bin"), workspaceBinAlias, "dir");
   writeFileSync(join(root, "node_modules/@types/node/index.d.ts"), "export {};");
   writeFileSync(script, readFileSync(sourceScript));
   writeFileSync(join(bin, "npm"), [
     "#!/usr/bin/env bash",
-    "for name in CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN GIT_ASKPASS; do",
+    "for name in CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN GIT_ASKPASS AWS_SECRET_ACCESS_KEY AZURE_CLIENT_SECRET GOOGLE_APPLICATION_CREDENTIALS NODE_OPTIONS NODE_PATH GIT_CONFIG_COUNT GIT_SSH_COMMAND DOCKER_HOST PYTHONPATH GPG_AGENT_INFO; do",
     "  if [[ -n \"${!name:-}\" ]]; then printf '%s=present\\n' \"$name\" >> \"$FAKE_NPM_ENV_CAPTURE\"; else printf '%s=missing\\n' \"$name\" >> \"$FAKE_NPM_ENV_CAPTURE\"; fi",
     "done",
     "exit \"${FAKE_NPM_EXIT:-0}\"",
@@ -31,7 +33,7 @@ function createFixture() {
   writeFileSync(join(root, "node_modules/.bin/npm"), "#!/usr/bin/env bash\necho hijacked > \"$NPM_HIJACK_MARKER\"\nexit 99\n", { mode: 0o755 });
   writeFileSync(join(bin, "tsx"), "#!/usr/bin/env bash\nprintf 'launched' > \"$LAUNCH_MARKER\"\nexec -a \"$1\" bash -c \"sleep 30\"\n", { mode: 0o755 });
   return {
-    root, script, bin, home,
+    root, script, bin, home, workspaceBinAlias,
     cleanup: () => {
       const pidPath = join(home, ".codespace-agent.pid");
       if (existsSync(pidPath)) {
@@ -51,7 +53,7 @@ function runService(fixture: ReturnType<typeof createFixture>, action: string, e
     env: {
       ...process.env,
       HOME: fixture.home,
-      PATH: join(fixture.root, "node_modules/.bin") + ":" + fixture.bin + ":" + process.env.PATH,
+      PATH: fixture.workspaceBinAlias + ":" + join(fixture.root, "node_modules/.bin") + ":" + fixture.bin + ":" + process.env.PATH,
       CODESPACE_AGENT_URL: "https://agent.invalid",
       CODESPACE_AGENT_TOKEN: "a".repeat(48),
       CODESPACE_NAME: "test-codespace",
@@ -63,6 +65,16 @@ function runService(fixture: ReturnType<typeof createFixture>, action: string, e
       GH_TOKEN: "synthetic-gh-token",
       NODE_AUTH_TOKEN: "synthetic-npm-token",
       GIT_ASKPASS: "/tmp/fake-askpass",
+      AWS_SECRET_ACCESS_KEY: "synthetic-aws-secret",
+      AZURE_CLIENT_SECRET: "synthetic-azure-secret",
+      GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcp.json",
+      NODE_OPTIONS: "--no-warnings",
+      NODE_PATH: "/tmp/node-modules",
+      GIT_CONFIG_COUNT: "1",
+      GIT_SSH_COMMAND: "fake-ssh",
+      DOCKER_HOST: "tcp://127.0.0.1:2375",
+      PYTHONPATH: "/tmp/python",
+      GPG_AGENT_INFO: "/tmp/gpg-agent",
       ...extraEnv,
     },
   });
@@ -78,7 +90,10 @@ test("agent startup is blocked when mandatory verification fails", () => {
     const captured = readFileSync(join(fixture.root, "npm-env.txt"), "utf8").trim().split("\n");
     assert.deepEqual(captured, [
       "CODESPACE_AGENT_TOKEN=missing", "GITHUB_TOKEN=missing", "GITHUB_CODESPACE_TOKEN=missing",
-      "GH_TOKEN=missing", "NODE_AUTH_TOKEN=missing", "GIT_ASKPASS=missing"
+      "GH_TOKEN=missing", "NODE_AUTH_TOKEN=missing", "GIT_ASKPASS=missing",
+      "AWS_SECRET_ACCESS_KEY=missing", "AZURE_CLIENT_SECRET=missing", "GOOGLE_APPLICATION_CREDENTIALS=missing",
+      "NODE_OPTIONS=missing", "NODE_PATH=missing", "GIT_CONFIG_COUNT=missing", "GIT_SSH_COMMAND=missing",
+      "DOCKER_HOST=missing", "PYTHONPATH=missing", "GPG_AGENT_INFO=missing"
     ], "verification npm process must not receive credentials or askpass access");
     assert.equal(existsSync(join(fixture.root, "npm-hijacked")), false, "workspace npm shim must not shadow system npm");
   } finally {

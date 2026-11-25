@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -625,7 +625,10 @@ const MAX_DEBUG_QUEUE_BYTES=8*1024*1024;
 function parseDebugMessages(session: DebugSession): void {
   while (true) {
     const boundary = session.buffer.indexOf("\r\n\r\n");
-    if (boundary < 0) return;
+    if (boundary < 0) {
+      assertProtocolHeaderCapacity(session.buffer.length, MAX_DEBUG_HEADER_BYTES);
+      return;
+    }
     const header = session.buffer.subarray(0, boundary).toString("ascii");
     const match = header.match(/(?:^|\r\n)Content-Length:\s*(\d+)/i);
     if (boundary > MAX_DEBUG_HEADER_BYTES) throw new Error("DAP header exceeds 8 KiB.");

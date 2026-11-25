@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { constants } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import { readFile, writeFile, mkdir, copyFile, access, lstat, rename, unlink } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -16,17 +16,21 @@ const valueAfter = (flag, fallback) => {
 const targetRoot = path.resolve(valueAfter("--target", process.cwd()));
 const skipInstall = args.includes("--no-install");
 const installerEnv = { ...process.env };
-for (const name of [
-  "CODESPACE_AGENT_TOKEN", "GITHUB_TOKEN", "GITHUB_CODESPACE_TOKEN", "GH_TOKEN",
-  "NODE_AUTH_TOKEN", "NPM_TOKEN", "GIT_ASKPASS", "GIT_ASKPASS_REQUIRE",
-  "VSCODE_GIT_ASKPASS_NODE", "VSCODE_GIT_ASKPASS_MAIN",
-  "VSCODE_GIT_ASKPASS_EXTRA_ARGS", "VSCODE_GIT_IPC_HANDLE"
-]) delete installerEnv[name];
-installerEnv.PATH = (installerEnv.PATH ?? "").split(path.delimiter).filter(directory => {
-  if (!directory) return false;
-  const resolved = path.resolve(directory);
-  return resolved !== targetRoot && !resolved.startsWith(targetRoot + path.sep);
-}).join(path.delimiter);
+const sensitiveEnvName = /(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|KEY|COOKIE|AUTH|CREDENTIAL|CERT|PRIVATE|SESSION|ASKPASS|ACCESS|AGENT|SOCKET)/i;
+const cloudCredentialEnvName = /^(?:AWS_|AZURE_|ARM_|GOOGLE_|GCLOUD_|CLOUDSDK_|GCP_|VAULT_|TF_VAR_|KUBECONFIG$|DOCKER_CONFIG$)/i;
+const executionEnvName = /^(?:NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|LD_.*|DYLD_.*|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|GIT_.*|DOCKER_HOST|DOCKER_CONTEXT|CONTAINER_HOST|COREPACK_.*|NPM_CONFIG_.*|npm_config_.*)$/i;
+for (const name of Object.keys(installerEnv)) {
+  if (sensitiveEnvName.test(name) || cloudCredentialEnvName.test(name) || executionEnvName.test(name)) delete installerEnv[name];
+}
+const targetRootReal = realpathSync(targetRoot);
+const safePath = [];
+for (const directory of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+  try {
+    const resolved = realpathSync(path.resolve(directory));
+    if (resolved !== targetRootReal && !resolved.startsWith(targetRootReal + path.sep) && !safePath.includes(resolved)) safePath.push(resolved);
+  } catch {}
+}
+installerEnv.PATH = safePath.join(path.delimiter);
 const manifest = JSON.parse(await readFile(path.join(moduleRoot, "module.json"), "utf8"));
 const destination = path.join(targetRoot, ".codespace-agent");
 const packagePath = path.join(targetRoot, "package.json");
@@ -90,9 +94,9 @@ for (const [name, version] of Object.entries(manifest.install.requiredPackages))
 
 const fragment = {
   features: manifest.install.devcontainerFeatures,
-  postCreateCommand: "sudo apt-get update && sudo apt-get install -y python3-pip && (unset CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN NPM_TOKEN GIT_ASKPASS GIT_ASKPASS_REQUIRE VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS VSCODE_GIT_IPC_HANDLE; npm install && npm run codespace-agent:check)",
-  postStartCommand: "npm run codespace-agent:start",
-  postAttachCommand: "npm run codespace-agent:start"
+  postCreateCommand: "sudo apt-get update && sudo apt-get install -y python3-pip && (/usr/bin/env -i HOME=\"$HOME\" PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/npm install --userconfig=/dev/null && /usr/bin/env -i HOME=\"$HOME\" PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/npm run codespace-agent:check --userconfig=/dev/null)",
+  postStartCommand: "bash .codespace-agent/agent-service.sh start",
+  postAttachCommand: "bash .codespace-agent/agent-service.sh start"
 };
 let nextDevcontainer = null;
 let needsManualDevcontainerMerge = false;

@@ -148,6 +148,12 @@ export function isLoopbackHost(value: string): boolean {
   return octets.length===4 && octets.every(part=>/^\d{1,3}$/.test(part)&&Number(part)>=0&&Number(part)<=255) && Number(octets[0])===127;
 }
 
+export function assertProtocolHeaderCapacity(headerBytes: number, maxBytes: number): void {
+  if (!Number.isSafeInteger(headerBytes) || headerBytes < 0 || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || headerBytes > maxBytes) {
+    throw new Error("Protocol header exceeds its configured byte limit.");
+  }
+}
+
 export function assertProtocolBufferCapacity(currentBytes: number, incomingBytes: number, maxBytes: number): void {
   if(!Number.isSafeInteger(currentBytes)||!Number.isSafeInteger(incomingBytes)||currentBytes<0||incomingBytes<0||currentBytes+incomingBytes>maxBytes)throw new Error("Protocol receive buffer limit exceeded.");
 }

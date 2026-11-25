@@ -17,10 +17,13 @@ filter_workspace_path() {
   for entry in "${entries[@]}"; do
     [[ -n "$entry" ]] || continue
     if [[ "$entry" == /* ]]; then absolute="$entry"; else absolute="$WORKSPACE_ROOT/$entry"; fi
-    case "$absolute" in
+    local resolved
+    resolved="$(/usr/bin/realpath -m -- "$absolute" 2>/dev/null || true)"
+    [[ -n "$resolved" ]] || continue
+    case "$resolved" in
       "$WORKSPACE_ROOT"|"$WORKSPACE_ROOT"/*) continue ;;
     esac
-    filtered="${filtered:+$filtered:}$entry"
+    if [[ -n "$filtered" ]]; then filtered="$filtered:$resolved"; else filtered="$resolved"; fi
   done
   printf '%s' "$filtered"
 }
@@ -39,6 +42,17 @@ agent_pid() {
   [[ "$command_line" == *"agent-entry.ts"* ]] || return 1
   printf '%s' "$pid"
 }
+sanitize_child_environment() {
+  local name
+  while IFS= read -r name; do
+    case "$name" in
+      *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*PASS*|*KEY*|*COOKIE*|*AUTH*|*CREDENTIAL*|*CERT*|*PRIVATE*|*SESSION*|*ASKPASS*|*ACCESS*|*AGENT*|*SOCKET*|AWS_*|AZURE_*|ARM_*|GOOGLE_*|GCLOUD_*|CLOUDSDK_*|GCP_*|VAULT_*|TF_VAR_*|KUBECONFIG|DOCKER_CONFIG|NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|LD_*|DYLD_*|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|GIT_*|DOCKER_HOST|DOCKER_CONTEXT|CONTAINER_HOST|COREPACK_*|NPM_CONFIG_*|npm_config_*)
+        unset "$name" 2>/dev/null || true
+        ;;
+    esac
+  done < <(compgen -e)
+}
+
 start_agent() {
   mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$PID_FILE")"
   if pid="$(agent_pid)"; then log "Codespaces agent already running (PID $pid)."; return 0; fi
@@ -59,7 +73,7 @@ start_agent() {
   else log "Cannot start agent; tsx executable was not found. Run npm ci in the workspace."; return 127; fi
 
   log "Running mandatory dependency, typecheck, and regression-test checks."
-  if ! (unset CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN NPM_TOKEN GIT_ASKPASS GIT_ASKPASS_REQUIRE VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS VSCODE_GIT_IPC_HANDLE; npm run "$CHECK_SCRIPT" --prefix "$WORKSPACE_ROOT"); then
+  if ! (sanitize_child_environment; npm run "$CHECK_SCRIPT" --prefix "$WORKSPACE_ROOT"); then
     log "Agent startup blocked because mandatory verification failed."
     return 1
   fi

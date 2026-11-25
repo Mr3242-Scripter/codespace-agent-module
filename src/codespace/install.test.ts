@@ -20,8 +20,8 @@ test("portable installer installs into a clean target without following links", 
     const pkg = JSON.parse(await fs.readFile(path.join(target, "package.json"), "utf8"));
     assert.equal(typeof pkg.scripts["codespace-agent:check"], "string");
     const devcontainer = JSON.parse(await fs.readFile(path.join(target, ".devcontainer", "devcontainer.json"), "utf8"));
-    assert.match(devcontainer.postCreateCommand, /unset CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN/);
-    assert.match(devcontainer.postCreateCommand, /npm install && npm run codespace-agent:check/);
+    assert.match(devcontainer.postCreateCommand, /env -i HOME=/);
+    assert.match(devcontainer.postCreateCommand, /npm install --userconfig=\/dev\/null && .*npm run codespace-agent:check --userconfig=\/dev\/null/);
   } finally {
     await fs.rm(parent, { recursive: true, force: true });
   }
@@ -55,10 +55,12 @@ test("portable installer strips credentials and workspace npm shims before packa
     await fs.mkdir(workspaceBin, { recursive: true });
     await fs.mkdir(bin, { recursive: true });
     await fs.writeFile(path.join(target, "package.json"), JSON.stringify({ name: "fixture" }));
+    const workspaceAlias = path.join(parent, "workspace-bin-alias");
+    await fs.symlink(workspaceBin, workspaceAlias, "dir");
     await fs.writeFile(path.join(workspaceBin, "npm"), "#!/usr/bin/env bash\necho hijacked > \"$NPM_HIJACK_MARKER\"\nexit 99\n", { mode: 0o755 });
     await fs.writeFile(path.join(bin, "npm"), [
       "#!/usr/bin/env bash",
-      "for name in CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN NPM_TOKEN GIT_ASKPASS; do",
+      "for name in CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN NPM_TOKEN GIT_ASKPASS AWS_SECRET_ACCESS_KEY AZURE_CLIENT_SECRET GOOGLE_APPLICATION_CREDENTIALS NODE_OPTIONS NODE_PATH GIT_CONFIG_COUNT GIT_SSH_COMMAND DOCKER_HOST PYTHONPATH GPG_AGENT_INFO; do",
       "  if [[ -n \"${!name:-}\" ]]; then printf '%s=present\\n' \"$name\" >> \"$INSTALLER_ENV_CAPTURE\"; else printf '%s=missing\\n' \"$name\" >> \"$INSTALLER_ENV_CAPTURE\"; fi",
       "done",
       "printf '%s\\n' '--- invocation ---' >> \"$INSTALLER_ENV_CAPTURE\"",
@@ -69,7 +71,7 @@ test("portable installer strips credentials and workspace npm shims before packa
       encoding: "utf8",
       env: {
         ...process.env,
-        PATH: [workspaceBin, bin, process.env.PATH].join(path.delimiter),
+        PATH: [workspaceAlias, workspaceBin, bin, process.env.PATH].join(path.delimiter),
         CODESPACE_AGENT_TOKEN: "agent-secret",
         GITHUB_TOKEN: "github-secret",
         GITHUB_CODESPACE_TOKEN: "codespace-secret",
@@ -77,6 +79,16 @@ test("portable installer strips credentials and workspace npm shims before packa
         NODE_AUTH_TOKEN: "npm-secret",
         NPM_TOKEN: "npm-secret-2",
         GIT_ASKPASS: "/tmp/fake-askpass",
+        AWS_SECRET_ACCESS_KEY: "aws-secret",
+        AZURE_CLIENT_SECRET: "azure-secret",
+        GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcp.json",
+        NODE_OPTIONS: "--no-warnings",
+        NODE_PATH: "/tmp/node-modules",
+        GIT_CONFIG_COUNT: "1",
+        GIT_SSH_COMMAND: "fake-ssh",
+        DOCKER_HOST: "tcp://127.0.0.1:2375",
+        PYTHONPATH: "/tmp/python",
+        GPG_AGENT_INFO: "/tmp/gpg-agent",
         INSTALLER_ENV_CAPTURE: path.join(parent, "installer-env.txt"),
         NPM_HIJACK_MARKER: path.join(parent, "npm-hijacked")
       }
@@ -89,6 +101,10 @@ test("portable installer strips credentials and workspace npm shims before packa
     assert.match(capture, /CODESPACE_AGENT_TOKEN=missing/);
     assert.match(capture, /GITHUB_TOKEN=missing/);
     assert.match(capture, /NODE_AUTH_TOKEN=missing/);
+    assert.match(capture, /AWS_SECRET_ACCESS_KEY=missing/);
+    assert.match(capture, /NODE_OPTIONS=missing/);
+    assert.match(capture, /GIT_CONFIG_COUNT=missing/);
+    assert.match(capture, /DOCKER_HOST=missing/);
   } finally {
     await fs.rm(parent, { recursive: true, force: true });
   }

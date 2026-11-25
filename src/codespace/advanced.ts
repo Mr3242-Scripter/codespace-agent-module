@@ -6,7 +6,7 @@ import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, resolveTrustedExecutable, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, resolveTrustedExecutable, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
@@ -209,7 +209,10 @@ const MAX_PROTOCOL_QUEUE_BYTES=8*1024*1024;
 function parseLsp(session: LspSession) {
   while (true) {
     const boundary=session.buffer.indexOf("\r\n\r\n");
-    if(boundary<0)return;
+    if(boundary<0) {
+      assertProtocolHeaderCapacity(session.buffer.length, MAX_PROTOCOL_HEADER_BYTES);
+      return;
+    }
     const header=session.buffer.subarray(0,boundary).toString("ascii");
     const match=header.match(/(?:^|\r\n)Content-Length:\s*(\d+)/i);
     if(boundary>MAX_PROTOCOL_HEADER_BYTES)throw new Error("JSON-RPC header exceeds 8 KiB.");
