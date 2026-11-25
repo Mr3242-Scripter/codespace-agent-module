@@ -57,9 +57,5 @@ fi
 if [[ -x "$WORKSPACE_ROOT/node_modules/.bin/tsx" ]]; then
   exec "$WORKSPACE_ROOT/node_modules/.bin/tsx" "$ROOT/agent-entry.ts"
 fi
-if command -v tsx >/dev/null 2>&1; then
-  exec "$(command -v tsx)" "$ROOT/agent-entry.ts"
-fi
-
 echo "tsx is required. Install the mandatory Codespaces agent dependencies first." >&2
 exit 127

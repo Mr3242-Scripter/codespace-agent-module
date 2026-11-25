@@ -73,8 +73,7 @@ start_agent() {
   if [[ "${#CODESPACE_AGENT_TOKEN}" -lt 32 ]]; then log "Cannot start agent; CODESPACE_AGENT_TOKEN is shorter than 32 characters."; return 2; fi
   local tsx
   if [[ -x "$WORKSPACE_ROOT/node_modules/.bin/tsx" ]]; then tsx="$WORKSPACE_ROOT/node_modules/.bin/tsx"
-  elif command -v tsx >/dev/null 2>&1; then tsx="$(command -v tsx)"
-  else log "Cannot start agent; tsx executable was not found. Run npm ci in the workspace."; return 127; fi
+  else log "Cannot start agent; workspace tsx executable was not found. Run npm ci in the workspace."; return 127; fi
 
   log "Running mandatory dependency, typecheck, and regression-test checks."
   if ! (sanitize_child_environment; npm run "$CHECK_SCRIPT" --prefix "$WORKSPACE_ROOT"); then
