@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -20,6 +20,7 @@ delete process.env.CODESPACE_AGENT_TOKEN;
 const childEnv = createChildProcessEnv();
 const codespace = process.env.CODESPACE_NAME ?? "";
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
+const systemEnv = { ...childEnv, PATH: filterTrustedExecutablePath(process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", root) };
 type Session = { child: any; output: string; ended: boolean; endedAt: number | null; exitCode: number | null; command: string; createdAt: string; pty: boolean };
 const sessions = new Map<string, Session>();
 function startSession(command: string, cwd = root, usePty = false) {
@@ -72,14 +73,9 @@ function resolvePath(input = "."): string {
 }
 async function resolveExecutable(command: string): Promise<string> {
   if (command.includes(path.sep)) return command;
-  const searchPath = filterTrustedExecutablePath(process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", root);
-  for (const directory of searchPath.split(path.delimiter).filter(Boolean)) {
-    const candidate = path.join(directory, command);
-    try { await fs.access(candidate, 1); return candidate; } catch {}
-  }
-  throw new Error(`Executable not found on PATH: ${command}`);
+  return resolveTrustedExecutable(command, systemEnv.PATH ?? "", root);
 }
-async function run(command: string, args: string[], cwd = root, timeout = 30_000, env: NodeJS.ProcessEnv = childEnv) {
+async function run(command: string, args: string[], cwd = root, timeout = 30_000, env: NodeJS.ProcessEnv = systemEnv) {
   const safeCwd = resolvePath(cwd);
   const executable = await resolveExecutable(command);
   const timeoutMs = Math.min(Math.max(timeout, 1000), 120_000);
@@ -239,7 +235,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       }
       await walk(resolvePath(a.path ?? ".")); return matches;
     }
-    case "terminal.exec": return run("bash", ["-lc", String(a.command)], a.cwd ? resolvePath(a.cwd) : root, a.timeoutMs);
+    case "terminal.exec": return run("bash", ["-lc", String(a.command)], a.cwd ? resolvePath(a.cwd) : root, a.timeoutMs, childEnv);
     case "terminal.start": return startSession(String(a.command), a.cwd ? resolvePath(a.cwd) : root, true);
     case "terminal.input": {
       const session = sessions.get(String(a.sessionId));
@@ -408,7 +404,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     }
     case "environment.tools": {
       const checks = await Promise.all(["node", "npm", "pnpm", "yarn", "git", "python3", "pip3", "docker", "gh", "code", "devcontainer"].map(async name => {
-        try { const r = await execFileAsync(name, ["--version"], { cwd: root, timeout: 5000, maxBuffer: 8192, env: childEnv }); return { name, available: true, version: (r.stdout || r.stderr).trim().split("\n")[0] }; }
+        try { const executable = await resolveExecutable(name); const r = await execFileAsync(executable, ["--version"], { cwd: root, timeout: 5000, maxBuffer: 8192, env: systemEnv }); return { name, available: true, version: (r.stdout || r.stderr).trim().split("\n")[0] }; }
         catch { return { name, available: false }; }
       }));
       return checks;
@@ -498,7 +494,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
     case "devcontainer.exec": {
       const command = Array.isArray(a.command) ? a.command.map(String) : [];
       if (!command.length || command.length > 64 || command.some(part => part.length > 4096)) throw new Error("command must be a non-empty argv array (maximum 64 entries).");
-      return run(command[0], command.slice(1), root, 120_000);
+      return run(command[0], command.slice(1), root, 120_000, childEnv);
     }
     case "workspace.disk_usage": {
       const filesystem = await run("df", ["-h", root], root);

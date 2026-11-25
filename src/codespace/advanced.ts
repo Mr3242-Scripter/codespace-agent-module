@@ -1,12 +1,12 @@
 import fs from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, resolveTrustedExecutable, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
@@ -21,7 +21,7 @@ function safePath(input = "."): string {
   return target;
 }
 async function readWorkspaceFileBounded(file: string, maxBytes: number): Promise<Buffer> {
-  const handle = await fs.open(file, "r");
+  const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("Workspace read target must be a regular file.");
@@ -41,7 +41,8 @@ async function readWorkspaceTextBounded(file: string, maxBytes: number): Promise
 }
 async function command(bin: string, args: string[], timeout = 15000) {
   try {
-    const result = await execFileAsync(bin, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: systemEnv });
+    const executable = await resolveTrustedExecutable(bin, systemEnv.PATH ?? "", root);
+    const result = await execFileAsync(executable, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: systemEnv });
     return { available: true, exitCode: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (error: any) {
     const missing = error?.code === "ENOENT";
@@ -264,7 +265,8 @@ async function runTask(task: string, args: string[] = [], timeoutMs = 120000) {
     return {task,manager,exitCode:1,stdout:"",stderr:`Task '${task}' is not defined in package.json and no safe automatic fallback applies.`};
   }
   try{
-    const result=await execFileAsync(executable,commandArgs,{cwd:root,timeout:Math.min(Math.max(timeoutMs,1000),600000),maxBuffer:8*1024*1024,windowsHide:true,env:systemEnv});
+    const resolvedExecutable = path.isAbsolute(executable) ? executable : await resolveTrustedExecutable(executable, systemEnv.PATH ?? "", root);
+    const result=await execFileAsync(resolvedExecutable,commandArgs,{cwd:root,timeout:Math.min(Math.max(timeoutMs,1000),600000),maxBuffer:8*1024*1024,windowsHide:true,env:systemEnv});
     return {task,manager,runner:executable,exitCode:0,stdout:result.stdout,stderr:result.stderr};
   }catch(error:any){
     return {task,manager,runner:executable,exitCode:typeof error?.code==="number"?error.code:null,stdout:error?.stdout??"",stderr:error?.stderr??error?.message??String(error)};
@@ -385,7 +387,7 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
     case "transfer.download.chunk": {
       const file=safePath(String(a.path)),offset=Number(a.offset??0),length=Math.min(Math.max(Number(a.length??262144),1),262144);
       if(!Number.isSafeInteger(offset)||offset<0)throw new Error("offset must be a non-negative integer.");
-      const handle=await fs.open(file,"r");
+      const handle=await fs.open(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
       try{
         const stat=await handle.stat();
         if(!stat.isFile())throw new Error("Download target must be a regular file.");

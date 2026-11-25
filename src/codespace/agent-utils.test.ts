@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -13,6 +13,7 @@ test("filename matching supports glob wildcards and legacy substring searches", 
   assert.equal(matchesFilenamePattern("nested/report.txt", "report.tx?"), true);
   assert.equal(matchesFilenamePattern("nested/report.txt", "port"), true);
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.lua"), false);
+  assert.throws(() => matchesFilenamePattern("a".repeat(255), "*a*a*a*a*a*a*a*a*a"), /8-wildcard complexity limit/);
 });
 
 test("completed sessions expire and old completed entries are evicted to enforce the cap", () => {
@@ -169,20 +170,28 @@ test("public forwarded-port exposure requires explicit confirmation", () => {
 });
 
 
-test("untrusted child process environments never inherit agent or GitHub credentials", () => {
+test("untrusted child process environments remove generic, cloud, SSH, and GitHub credentials", () => {
   const source = {
-    PATH: "/usr/bin",
-    CODESPACE_AGENT_TOKEN: "agent-secret",
-    GITHUB_TOKEN: "github-secret",
-    GITHUB_CODESPACE_TOKEN: "codespace-secret",
-    GH_TOKEN: "gh-secret",
-    OTHER_TOKEN: "unrelated-value"
+    PATH: "/usr/bin", HOME: "/home/node",
+    CODESPACE_AGENT_TOKEN: "agent-secret", GITHUB_TOKEN: "github-secret",
+    GITHUB_CODESPACE_TOKEN: "codespace-secret", GH_TOKEN: "gh-secret",
+    AWS_ACCESS_KEY_ID: "aws-access", AWS_SECRET_ACCESS_KEY: "aws-secret",
+    AZURE_CLIENT_SECRET: "azure-secret", GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcp.json",
+    SSH_AUTH_SOCK: "/tmp/ssh-agent.sock", NODE_AUTH_TOKEN: "npm-secret",
+    API_KEY: "api-secret", NODE_OPTIONS: "--require /tmp/evil.js", NODE_PATH: "/tmp/modules",
+    LD_PRELOAD: "/tmp/evil.so", BASH_ENV: "/tmp/evil.sh", GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.sshCommand", GIT_CONFIG_VALUE_0: "evil",
+    GIT_SSH_COMMAND: "evil-ssh", npm_config_userconfig: "/tmp/npmrc",
+    PYTHONPATH: "/tmp/python", JAVA_TOOL_OPTIONS: "-javaagent:/tmp/evil.jar",
+    GIT_EXEC_PATH: "/tmp/git-exec", GIT_DIR: "/tmp/attacker.git",
+    DOCKER_HOST: "tcp://127.0.0.1:2375", GPG_AGENT_INFO: "/tmp/gpg-agent", OTHER_VALUE: "keep-me"
   };
   const child = createChildProcessEnv(source);
   assert.equal(child.PATH, "/usr/bin");
-  assert.equal(child.OTHER_TOKEN, "unrelated-value");
-  for (const name of ["CODESPACE_AGENT_TOKEN", "GITHUB_TOKEN", "GITHUB_CODESPACE_TOKEN", "GH_TOKEN"]) {
-    assert.equal(child[name as keyof typeof child], undefined);
+  assert.equal(child.HOME, "/home/node");
+  assert.equal(child.OTHER_VALUE, "keep-me");
+  for (const name of Object.keys(source).filter(name => name !== "PATH" && name !== "HOME" && name !== "OTHER_VALUE")) {
+    assert.equal(child[name as keyof typeof child], undefined, `${name} must be removed`);
   }
   assert.equal(source.GITHUB_TOKEN, "github-secret");
 });
@@ -204,9 +213,32 @@ test("only trusted GitHub CLI environments receive a scoped GH_TOKEN", () => {
   assert.equal(child.PATH, "/usr/bin");
 });
 
-test("trusted executable lookup excludes workspace-controlled PATH entries", () => {
-  const filtered = filterTrustedExecutablePath("/usr/bin:/workspace/project/node_modules/.bin:/opt/tools:/workspace/project/tools", "/workspace/project");
-  assert.equal(filtered, ["/usr/bin", "/opt/tools"].join(path.delimiter));
+test("trusted PATH filtering resolves aliases and excludes user-writable directories", async () => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-path-filter-"));
+  try {
+    const workspace = path.join(parent, "workspace"), home = path.join(parent, "home");
+    const userBin = path.join(home, "bin"), writableBin = path.join(parent, "writable");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(userBin, { recursive: true });
+    await fs.mkdir(writableBin, { recursive: true });
+    await fs.chmod(writableBin, 0o777);
+    const workspaceAlias = path.join(parent, "workspace-alias");
+    await fs.symlink(workspace, workspaceAlias, "dir");
+    const filtered = filterTrustedExecutablePath(
+      [userBin, workspaceAlias, writableBin, "/usr/bin"].join(path.delimiter),
+      workspace, home, path.join(parent, "tmp"), 0
+    );
+    assert.equal(filtered, await fs.realpath("/usr/bin"));
+  } finally { await fs.rm(parent, { recursive: true, force: true }); }
+});
+
+test("trusted executable resolution accepts only root-owned non-writable binaries", async () => {
+  const workspace = path.resolve("workspace-test-root");
+  const home = os.homedir();
+  const temp = os.tmpdir();
+  const resolved = await resolveTrustedExecutable("python3", "/usr/bin", workspace, home, 0, temp);
+  assert.equal(resolved, await fs.realpath("/usr/bin/python3"));
+  await assert.rejects(resolveTrustedExecutable("this-command-should-not-exist", "/usr/bin", workspace, home, 0, temp), /root-owned system directories/);
 });
 
 test("bounded file reads preserve small files and reject oversized files", async () => {
@@ -217,6 +249,9 @@ test("bounded file reads preserve small files and reject oversized files", async
     await fs.writeFile(large, "0123456789");
     assert.equal(await readFileBounded(small, 5), "hello");
     await assert.rejects(readFileBounded(large, 5), /read limit.*chunked/i);
+    const link = path.join(dir, "small-link.txt");
+    await fs.symlink(small, link);
+    await assert.rejects(readFileBounded(link, 5), /symbolic link|too many levels|eloop/i);
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
 

@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { constants, lstatSync, realpathSync } from "node:fs";
+import { constants, lstatSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -87,6 +87,8 @@ export function parseMakeTargets(makefile: string): string[] {
 export function matchesFilenamePattern(value: string, pattern: string): boolean {
   const normalizedPattern = pattern.replace(/\\/g, "/");
   const normalizedValue = value.replace(/\\/g, "/");
+  const wildcardCount = normalizedPattern.match(/\*\*\/|\*\*|\*|\?/g)?.length ?? 0;
+  if (wildcardCount > 8) throw new Error("Filename pattern exceeds the 8-wildcard complexity limit.");
   if (!/[?*]/.test(normalizedPattern)) {
     const needle = normalizedPattern.toLowerCase();
     return normalizedValue.toLowerCase().includes(needle);
@@ -156,24 +158,84 @@ export function assertProtocolQueueCapacity(queuedBytes: number, messageBytes: n
   if (!Number.isSafeInteger(queuedBytes) || !Number.isSafeInteger(queuedMessages) || queuedBytes < 0 || queuedMessages < 0 || queuedMessages + 1 > maxMessages || queuedBytes + charge > maxBytes) throw new Error("Protocol queued-message limit exceeded.");
 }
 
+const SENSITIVE_ENV_NAME = /(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|KEY|COOKIE|AUTH|CREDENTIAL|CERT|PRIVATE|SESSION|ASKPASS|ACCESS|AGENT|SOCKET)/i;
+const CLOUD_CREDENTIAL_ENV_NAME = /^(?:AWS_|AZURE_|ARM_|GOOGLE_|GCLOUD_|CLOUDSDK_|GCP_|VAULT_|TF_VAR_|KUBECONFIG$|DOCKER_CONFIG$)/i;
+const EXECUTION_ENV_NAME = /^(?:NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|LD_.*|DYLD_.*|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|GIT_.*|DOCKER_HOST|DOCKER_CONTEXT|CONTAINER_HOST|COREPACK_.*|NPM_CONFIG_.*|npm_config_.*)$/i;
+
 export function createChildProcessEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env = { ...source };
-  for (const name of [
-    "CODESPACE_AGENT_TOKEN",
-    "GITHUB_TOKEN",
-    "GITHUB_CODESPACE_TOKEN",
-    "GH_TOKEN"
-  ]) delete env[name];
+  for (const name of Object.keys(env)) {
+    if (SENSITIVE_ENV_NAME.test(name) || CLOUD_CREDENTIAL_ENV_NAME.test(name) || EXECUTION_ENV_NAME.test(name)) delete env[name];
+  }
   return env;
 }
 
-export function filterTrustedExecutablePath(searchPath: string, workspaceRoot: string): string {
-  const root = path.resolve(workspaceRoot);
-  return searchPath.split(path.delimiter).filter(directory => {
-    if (!directory) return false;
-    const resolved = path.resolve(directory);
-    return resolved !== root && !resolved.startsWith(root + path.sep);
-  }).join(path.delimiter);
+function isInsidePath(candidate: string, base: string): boolean {
+  return candidate === base || candidate.startsWith(base + path.sep);
+}
+
+function isTrustedDirectorySync(directory: string, trustedOwnerUid: number): boolean {
+  let current = path.resolve(directory);
+  while (true) {
+    let stat;
+    try { stat = statSync(current); } catch { return false; }
+    if (!stat.isDirectory() || stat.uid !== trustedOwnerUid || (stat.mode & 0o022) !== 0) return false;
+    const parent = path.dirname(current);
+    if (parent === current) return true;
+    current = parent;
+  }
+}
+
+async function isTrustedDirectory(directory: string, trustedOwnerUid: number): Promise<boolean> {
+  let current = path.resolve(directory);
+  while (true) {
+    let stat;
+    try { stat = await fs.stat(current); } catch { return false; }
+    if (!stat.isDirectory() || stat.uid !== trustedOwnerUid || (stat.mode & 0o022) !== 0) return false;
+    const parent = path.dirname(current);
+    if (parent === current) return true;
+    current = parent;
+  }
+}
+
+export function filterTrustedExecutablePath(
+  searchPath: string,
+  workspaceRoot: string,
+  homeDirectory = os.homedir(),
+  temporaryDirectory = os.tmpdir(),
+  trustedOwnerUid = 0
+): string {
+  const excludedRoots = [path.resolve(workspaceRoot), path.resolve(homeDirectory), path.resolve(temporaryDirectory)];
+  const safe: string[] = [];
+  for (const entry of searchPath.split(path.delimiter).filter(Boolean)) {
+    try {
+      const directory = realpathSync(path.resolve(entry));
+      if (excludedRoots.some(base => isInsidePath(directory, base))) continue;
+      if (!isTrustedDirectorySync(directory, trustedOwnerUid)) continue;
+      if (!safe.includes(directory)) safe.push(directory);
+    } catch {}
+  }
+  return safe.join(path.delimiter);
+}
+
+export async function resolveTrustedExecutable(command: string, searchPath: string, workspaceRoot: string, homeDirectory = os.homedir(), trustedOwnerUid = 0, temporaryDirectory = os.tmpdir()): Promise<string> {
+  if (!/^[A-Za-z0-9_.-]{1,128}$/.test(command)) throw new Error("Trusted executable must be a simple command name.");
+  const excludedRoots = [path.resolve(workspaceRoot), path.resolve(homeDirectory), path.resolve(temporaryDirectory)];
+  for (const entry of searchPath.split(path.delimiter).filter(Boolean)) {
+    try {
+      const directory = await fs.realpath(path.resolve(entry));
+      if (excludedRoots.some(base => isInsidePath(directory, base))) continue;
+      if (!await isTrustedDirectory(directory, trustedOwnerUid)) continue;
+      const candidate = await fs.realpath(path.join(directory, command));
+      if (excludedRoots.some(base => isInsidePath(candidate, base))) continue;
+      if (!await isTrustedDirectory(path.dirname(candidate), trustedOwnerUid)) continue;
+      const fileStat = await fs.stat(candidate);
+      if (!fileStat.isFile() || fileStat.uid !== trustedOwnerUid || (fileStat.mode & 0o022) !== 0 || (fileStat.mode & 0o111) === 0) continue;
+      await fs.access(candidate, constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  throw new Error("Trusted executable not found in root-owned system directories: " + command);
 }
 
 export function createGitHubCliEnv(source: NodeJS.ProcessEnv = process.env, workspaceRoot?: string): NodeJS.ProcessEnv {
@@ -185,7 +247,7 @@ export function createGitHubCliEnv(source: NodeJS.ProcessEnv = process.env, work
 }
 
 export async function readFileBufferBounded(filePath: string, maxBytes: number): Promise<Buffer> {
-  const handle = await fs.open(filePath, "r");
+  const handle = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("Target must be a regular file.");
