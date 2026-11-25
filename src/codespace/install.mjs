@@ -15,6 +15,18 @@ const valueAfter = (flag, fallback) => {
 };
 const targetRoot = path.resolve(valueAfter("--target", process.cwd()));
 const skipInstall = args.includes("--no-install");
+const installerEnv = { ...process.env };
+for (const name of [
+  "CODESPACE_AGENT_TOKEN", "GITHUB_TOKEN", "GITHUB_CODESPACE_TOKEN", "GH_TOKEN",
+  "NODE_AUTH_TOKEN", "NPM_TOKEN", "GIT_ASKPASS", "GIT_ASKPASS_REQUIRE",
+  "VSCODE_GIT_ASKPASS_NODE", "VSCODE_GIT_ASKPASS_MAIN",
+  "VSCODE_GIT_ASKPASS_EXTRA_ARGS", "VSCODE_GIT_IPC_HANDLE"
+]) delete installerEnv[name];
+installerEnv.PATH = (installerEnv.PATH ?? "").split(path.delimiter).filter(directory => {
+  if (!directory) return false;
+  const resolved = path.resolve(directory);
+  return resolved !== targetRoot && !resolved.startsWith(targetRoot + path.sep);
+}).join(path.delimiter);
 const manifest = JSON.parse(await readFile(path.join(moduleRoot, "module.json"), "utf8"));
 const destination = path.join(targetRoot, ".codespace-agent");
 const packagePath = path.join(targetRoot, "package.json");
@@ -78,7 +90,7 @@ for (const [name, version] of Object.entries(manifest.install.requiredPackages))
 
 const fragment = {
   features: manifest.install.devcontainerFeatures,
-  postCreateCommand: "sudo apt-get update && sudo apt-get install -y python3-pip && npm install && npm run codespace-agent:check",
+  postCreateCommand: "sudo apt-get update && sudo apt-get install -y python3-pip && (unset CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN NPM_TOKEN GIT_ASKPASS GIT_ASKPASS_REQUIRE VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS VSCODE_GIT_IPC_HANDLE; npm install && npm run codespace-agent:check)",
   postStartCommand: "npm run codespace-agent:start",
   postAttachCommand: "npm run codespace-agent:start"
 };
@@ -150,11 +162,11 @@ if (nextDevcontainer !== null) {
 
 if (!skipInstall) {
   console.log("Installing the required Codespaces agent npm dependencies...");
-  const result = spawnSync("npm", ["install"], { cwd: targetRoot, stdio: "inherit" });
+  const result = spawnSync("npm", ["install"], { cwd: targetRoot, stdio: "inherit", env: installerEnv });
   if (result.error) fail(`Could not run npm install: ${result.error.message}`);
   if (result.status !== 0) fail(`npm install failed with exit code ${result.status ?? "unknown"}.`);
   console.log("Running the complete Codespaces agent verification suite...");
-  const check = spawnSync("npm", ["run", "codespace-agent:check"], { cwd: targetRoot, stdio: "inherit" });
+  const check = spawnSync("npm", ["run", "codespace-agent:check"], { cwd: targetRoot, stdio: "inherit", env: installerEnv });
   if (check.error) fail(`Could not run verification: ${check.error.message}`);
   if (check.status !== 0) fail(`Codespaces agent verification failed with exit code ${check.status ?? "unknown"}.`);
 }

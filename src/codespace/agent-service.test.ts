@@ -9,17 +9,26 @@ import test from "node:test";
 const sourceScript = fileURLToPath(new URL("./agent-service.sh", import.meta.url));
 
 function createFixture() {
-  const root = mkdtempSync(join(tmpdir(), "codespace-agent-service-"));
+  const parent = mkdtempSync(join(tmpdir(), "codespace-agent-service-"));
+  const root = join(parent, "workspace");
   const script = join(root, "src/codespace/agent-service.sh");
-  const bin = join(root, "bin");
-  const home = join(root, "home");
+  const bin = join(parent, "bin");
+  const home = join(parent, "home");
   mkdirSync(join(root, "src/codespace"), { recursive: true });
   mkdirSync(join(root, "node_modules/@types/node"), { recursive: true });
+  mkdirSync(join(root, "node_modules/.bin"), { recursive: true });
   mkdirSync(bin, { recursive: true });
   mkdirSync(home, { recursive: true });
   writeFileSync(join(root, "node_modules/@types/node/index.d.ts"), "export {};");
   writeFileSync(script, readFileSync(sourceScript));
-  writeFileSync(join(bin, "npm"), "#!/usr/bin/env bash\nexit \"\${FAKE_NPM_EXIT:-0}\"\n", { mode: 0o755 });
+  writeFileSync(join(bin, "npm"), [
+    "#!/usr/bin/env bash",
+    "for name in CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN GIT_ASKPASS; do",
+    "  if [[ -n \"${!name:-}\" ]]; then printf '%s=present\\n' \"$name\" >> \"$FAKE_NPM_ENV_CAPTURE\"; else printf '%s=missing\\n' \"$name\" >> \"$FAKE_NPM_ENV_CAPTURE\"; fi",
+    "done",
+    "exit \"${FAKE_NPM_EXIT:-0}\"",
+  ].join("\n"), { mode: 0o755 });
+  writeFileSync(join(root, "node_modules/.bin/npm"), "#!/usr/bin/env bash\necho hijacked > \"$NPM_HIJACK_MARKER\"\nexit 99\n", { mode: 0o755 });
   writeFileSync(join(bin, "tsx"), "#!/usr/bin/env bash\nprintf 'launched' > \"$LAUNCH_MARKER\"\nexec -a \"$1\" bash -c \"sleep 30\"\n", { mode: 0o755 });
   return {
     root, script, bin, home,
@@ -29,7 +38,7 @@ function createFixture() {
         const pid = Number(readFileSync(pidPath, "utf8").trim());
         if (Number.isInteger(pid) && pid > 1) spawnSync("kill", ["-TERM", String(pid)]);
       }
-      rmSync(root, { recursive: true, force: true });
+      rmSync(parent, { recursive: true, force: true });
     },
   };
 }
@@ -42,11 +51,18 @@ function runService(fixture: ReturnType<typeof createFixture>, action: string, e
     env: {
       ...process.env,
       HOME: fixture.home,
-      PATH: fixture.bin + ":" + process.env.PATH,
+      PATH: join(fixture.root, "node_modules/.bin") + ":" + fixture.bin + ":" + process.env.PATH,
       CODESPACE_AGENT_URL: "https://agent.invalid",
       CODESPACE_AGENT_TOKEN: "a".repeat(48),
       CODESPACE_NAME: "test-codespace",
       LAUNCH_MARKER: join(fixture.root, "launched"),
+      NPM_HIJACK_MARKER: join(fixture.root, "npm-hijacked"),
+      FAKE_NPM_ENV_CAPTURE: join(fixture.root, "npm-env.txt"),
+      GITHUB_TOKEN: "synthetic-github-token",
+      GITHUB_CODESPACE_TOKEN: "synthetic-codespace-token",
+      GH_TOKEN: "synthetic-gh-token",
+      NODE_AUTH_TOKEN: "synthetic-npm-token",
+      GIT_ASKPASS: "/tmp/fake-askpass",
       ...extraEnv,
     },
   });
@@ -59,6 +75,12 @@ test("agent startup is blocked when mandatory verification fails", () => {
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stderr, /mandatory verification failed/i);
     assert.equal(existsSync(join(fixture.root, "launched")), false, "agent entrypoint must not launch");
+    const captured = readFileSync(join(fixture.root, "npm-env.txt"), "utf8").trim().split("\n");
+    assert.deepEqual(captured, [
+      "CODESPACE_AGENT_TOKEN=missing", "GITHUB_TOKEN=missing", "GITHUB_CODESPACE_TOKEN=missing",
+      "GH_TOKEN=missing", "NODE_AUTH_TOKEN=missing", "GIT_ASKPASS=missing"
+    ], "verification npm process must not receive credentials or askpass access");
+    assert.equal(existsSync(join(fixture.root, "npm-hijacked")), false, "workspace npm shim must not shadow system npm");
   } finally {
     fixture.cleanup();
   }

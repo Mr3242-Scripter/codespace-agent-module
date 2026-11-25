@@ -10,7 +10,22 @@ else
   WORKSPACE_ROOT="$(cd "$ROOT/../.." && pwd)"
 fi
 CHECK_SCRIPT="${CODESPACE_AGENT_CHECK_SCRIPT:-check:agent}"
-export PATH="$WORKSPACE_ROOT/node_modules/.bin:$PATH"
+filter_workspace_path() {
+  local entry filtered="" absolute
+  local -a entries=()
+  IFS=: read -r -a entries <<< "${1:-}"
+  for entry in "${entries[@]}"; do
+    [[ -n "$entry" ]] || continue
+    if [[ "$entry" == /* ]]; then absolute="$entry"; else absolute="$WORKSPACE_ROOT/$entry"; fi
+    case "$absolute" in
+      "$WORKSPACE_ROOT"|"$WORKSPACE_ROOT"/*) continue ;;
+    esac
+    filtered="${filtered:+$filtered:}$entry"
+  done
+  printf '%s' "$filtered"
+}
+PATH="$(filter_workspace_path "$PATH")"
+export PATH
 PID_FILE="${CODESPACE_AGENT_PID_FILE:-$HOME/.codespace-agent.pid}"
 LOG_FILE="${CODESPACE_AGENT_LOG_FILE:-$HOME/.codespace-agent.log}"
 log() { local message="$*"; printf '[%s] %s\n' "$(date -Is)" "$message" | tee -a "$LOG_FILE" >&2; }
@@ -39,12 +54,12 @@ start_agent() {
   if (("${#missing[@]}" > 0)); then log "Cannot start agent; missing environment variable(s): ${missing[*]}"; return 2; fi
   if [[ "${#CODESPACE_AGENT_TOKEN}" -lt 32 ]]; then log "Cannot start agent; CODESPACE_AGENT_TOKEN is shorter than 32 characters."; return 2; fi
   local tsx
-  if command -v tsx >/dev/null 2>&1; then tsx="$(command -v tsx)"
-  elif [[ -x "$ROOT/../../node_modules/.bin/tsx" ]]; then tsx="$ROOT/../../node_modules/.bin/tsx"
+  if [[ -x "$WORKSPACE_ROOT/node_modules/.bin/tsx" ]]; then tsx="$WORKSPACE_ROOT/node_modules/.bin/tsx"
+  elif command -v tsx >/dev/null 2>&1; then tsx="$(command -v tsx)"
   else log "Cannot start agent; tsx executable was not found. Run npm ci in the workspace."; return 127; fi
 
   log "Running mandatory dependency, typecheck, and regression-test checks."
-  if ! npm run "$CHECK_SCRIPT" --prefix "$WORKSPACE_ROOT"; then
+  if ! (unset CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN NPM_TOKEN GIT_ASKPASS GIT_ASKPASS_REQUIRE VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS VSCODE_GIT_IPC_HANDLE; npm run "$CHECK_SCRIPT" --prefix "$WORKSPACE_ROOT"); then
     log "Agent startup blocked because mandatory verification failed."
     return 1
   fi

@@ -74,9 +74,8 @@ Required system executables: Python 3, pip, Git, Docker CLI, GitHub CLI (`gh`), 
 - Resumable uploads are limited to 256 MiB per transfer and 512 MiB reserved across all active transfers (20 sessions maximum).
 - Process signalling is restricted to PIDs belonging to sessions started and tracked by this agent.
 - Workspace task discovery reads the root Makefile as bounded text and parses target declarations statically; it never invokes the make executable or evaluates Makefile functions while listing tasks.
-- Untrusted child processes do not inherit the agent, GitHub, or Codespaces authentication tokens. Only the agent's fixed internal GitHub CLI operations receive a scoped GH_TOKEN.
+- Untrusted child processes do not inherit agent, GitHub, or Codespaces authentication tokens. Fixed internal GitHub CLI operations receive a scoped `GH_TOKEN`; trusted system-command lookup excludes workspace-controlled PATH entries.
 - Relay requests have a 30-second timeout; JSON relay responses are capped at 1 MiB and outbound job results at 900 KiB.
-- Agent and GitHub authentication tokens are removed from untrusted child-process environments, including terminal, process, LSP, DAP, task, and helper commands.
 - `fs.read` and legacy `transfer.read` are limited to 512 KiB; larger files must use chunked downloads. Directory listings are limited to 1,000 entries. Filesystem search scans at most 1,000 files / 16 MiB across 5,000 entries and skips individual files larger than 1 MiB.
 - LSP and DAP queues are limited to 8 MiB of accounted message storage and 4,096 messages; each queued message accounts for at least 256 bytes of overhead.
 - Workspace path validation rejects symlink components, including symlinks that resolve back inside the workspace. Directory listing and stat operations use `lstat` so symlink metadata is not followed. Path-based filesystem operations still cannot provide a complete `openat2`-style race-free guarantee if an untrusted process concurrently replaces parent directories; isolate the agent from untrusted concurrent workspace writers.

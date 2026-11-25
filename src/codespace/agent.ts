@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -30,13 +30,13 @@ function startSession(command: string, cwd = root, usePty = false) {
   const session: Session = { child: null, output: "", ended: false, endedAt: null, exitCode: null, command, createdAt: new Date().toISOString(), pty: Boolean(usePty) };
   const append = (chunk: string | Buffer) => { session.output = (session.output + chunk.toString()).slice(-100_000); };
   if (session.pty) {
-    session.child = ptyModule.spawn("bash", ["-lc", command], {
+    session.child = ptyModule.spawn(process.platform === "win32" ? "bash" : "/bin/bash", ["-lc", command], {
       name: "xterm-256color", cols: 120, rows: 30, cwd: safeCwd, env: childEnv
     });
     session.child.onData(append);
     session.child.onExit((event: { exitCode: number }) => { session.ended = true; session.endedAt = Date.now(); session.exitCode = event.exitCode; });
   } else {
-    session.child = spawn("bash", ["-lc", command], { cwd: safeCwd, env: childEnv, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+    session.child = spawn(process.platform === "win32" ? "bash" : "/bin/bash", ["-lc", command], { cwd: safeCwd, env: childEnv, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     session.child.stdout.on("data", append);
     session.child.stderr.on("data", append);
     session.child.on("close", (code: number | null) => { session.ended = true; session.endedAt = Date.now(); session.exitCode = code; });
@@ -72,7 +72,7 @@ function resolvePath(input = "."): string {
 }
 async function resolveExecutable(command: string): Promise<string> {
   if (command.includes(path.sep)) return command;
-  const searchPath = process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  const searchPath = filterTrustedExecutablePath(process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", root);
   for (const directory of searchPath.split(path.delimiter).filter(Boolean)) {
     const candidate = path.join(directory, command);
     try { await fs.access(candidate, 1); return candidate; } catch {}
@@ -489,7 +489,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       if (a.confirm !== true) throw new Error("Rebuilding a Codespace requires confirm=true.");
       try {
         const args = ["codespace", "rebuild", "--codespace", codespace, ...(a.removeExistingContainer ? ["--full"] : [])];
-        const result = await run("gh", args, root, 120_000, createGitHubCliEnv());
+        const result = await run("gh", args, root, 120_000, createGitHubCliEnv(process.env, root));
         return { requested: true, operation: "codespace-rebuild", ...result, note: "The Codespace may disconnect while GitHub rebuilds its container. The agent should reconnect through the configured postStartCommand." };
       } catch (error: any) {
         return { requested: false, available: false, reason: error?.message ?? String(error), fallback: "Run 'Codespaces: Rebuild Container' from the GitHub Codespaces Command Palette." };
@@ -510,7 +510,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       let forwardedPortsError: string | undefined;
       if (operation === "ports.list") {
         try {
-          const forwarded = await run("gh", ["codespace", "ports", "--codespace", codespace, "--json", "sourcePort,visibility,browseUrl,label"], root, 15000, createGitHubCliEnv());
+          const forwarded = await run("gh", ["codespace", "ports", "--codespace", codespace, "--json", "sourcePort,visibility,browseUrl,label"], root, 15000, createGitHubCliEnv(process.env, root));
           return { source: "gh-codespace-ports", forwardedPorts: JSON.parse(forwarded.stdout || "[]") };
         } catch (error: any) {
           forwardedPortsError = error?.message ?? String(error);
@@ -555,7 +555,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       if (!["private", "org", "public"].includes(visibility)) throw new Error("visibility must be private, org, or public.");
       requirePublicPortConfirmation(visibility,a.confirm===true);
       try {
-        const result = await run("gh", ["codespace", "ports", "visibility", `${port}:${visibility}`, "--codespace", codespace], root, 30000, createGitHubCliEnv());
+        const result = await run("gh", ["codespace", "ports", "visibility", `${port}:${visibility}`, "--codespace", codespace], root, 30000, createGitHubCliEnv(process.env, root));
         return { updated: true, available: true, codespace, port, visibility, ...result };
       } catch (error: any) {
         const detail = error?.message ?? String(error);

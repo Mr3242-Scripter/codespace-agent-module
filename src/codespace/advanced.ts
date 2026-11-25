@@ -6,11 +6,12 @@ import { execFile, spawn } from "node:child_process";
 import { watch as watchFs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createChildProcessEnv, filterTrustedExecutablePath, isExpired, linkFileNoReplace, parseMakeTargets, pruneEndedSessions, writeFilesAtomically } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const root = realpathSync(path.resolve(process.env.CODESPACE_WORKSPACE ?? process.cwd()));
 const childEnv = createChildProcessEnv();
+const systemEnv = { ...childEnv, PATH: filterTrustedExecutablePath(childEnv.PATH ?? "", root) };
 const startedAt = Date.now();
 
 function safePath(input = "."): string {
@@ -40,7 +41,7 @@ async function readWorkspaceTextBounded(file: string, maxBytes: number): Promise
 }
 async function command(bin: string, args: string[], timeout = 15000) {
   try {
-    const result = await execFileAsync(bin, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: childEnv });
+    const result = await execFileAsync(bin, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: systemEnv });
     return { available: true, exitCode: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (error: any) {
     const missing = error?.code === "ENOENT";
@@ -263,7 +264,7 @@ async function runTask(task: string, args: string[] = [], timeoutMs = 120000) {
     return {task,manager,exitCode:1,stdout:"",stderr:`Task '${task}' is not defined in package.json and no safe automatic fallback applies.`};
   }
   try{
-    const result=await execFileAsync(executable,commandArgs,{cwd:root,timeout:Math.min(Math.max(timeoutMs,1000),600000),maxBuffer:8*1024*1024,windowsHide:true,env:childEnv});
+    const result=await execFileAsync(executable,commandArgs,{cwd:root,timeout:Math.min(Math.max(timeoutMs,1000),600000),maxBuffer:8*1024*1024,windowsHide:true,env:systemEnv});
     return {task,manager,runner:executable,exitCode:0,stdout:result.stdout,stderr:result.stderr};
   }catch(error:any){
     return {task,manager,runner:executable,exitCode:typeof error?.code==="number"?error.code:null,stdout:error?.stdout??"",stderr:error?.stderr??error?.message??String(error)};

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
+import { assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, validateRelayUrl, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -195,12 +195,18 @@ test("only trusted GitHub CLI environments receive a scoped GH_TOKEN", () => {
     GITHUB_CODESPACE_TOKEN: "codespace-secret",
     GH_TOKEN: "gh-secret"
   };
-  const child = createGitHubCliEnv(source);
+  const child = createGitHubCliEnv(source, "/workspace/project");
   assert.equal(child.GH_TOKEN, "github-secret");
   assert.equal(child.GITHUB_TOKEN, undefined);
   assert.equal(child.GITHUB_CODESPACE_TOKEN, undefined);
   assert.equal(child.CODESPACE_AGENT_TOKEN, undefined);
   assert.equal(source.GITHUB_TOKEN, "github-secret");
+  assert.equal(child.PATH, "/usr/bin");
+});
+
+test("trusted executable lookup excludes workspace-controlled PATH entries", () => {
+  const filtered = filterTrustedExecutablePath("/usr/bin:/workspace/project/node_modules/.bin:/opt/tools:/workspace/project/tools", "/workspace/project");
+  assert.equal(filtered, ["/usr/bin", "/opt/tools"].join(path.delimiter));
 });
 
 test("bounded file reads preserve small files and reject oversized files", async () => {

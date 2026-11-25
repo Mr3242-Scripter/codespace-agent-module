@@ -167,8 +167,18 @@ export function createChildProcessEnv(source: NodeJS.ProcessEnv = process.env): 
   return env;
 }
 
-export function createGitHubCliEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function filterTrustedExecutablePath(searchPath: string, workspaceRoot: string): string {
+  const root = path.resolve(workspaceRoot);
+  return searchPath.split(path.delimiter).filter(directory => {
+    if (!directory) return false;
+    const resolved = path.resolve(directory);
+    return resolved !== root && !resolved.startsWith(root + path.sep);
+  }).join(path.delimiter);
+}
+
+export function createGitHubCliEnv(source: NodeJS.ProcessEnv = process.env, workspaceRoot?: string): NodeJS.ProcessEnv {
   const env = createChildProcessEnv(source);
+  if (workspaceRoot && env.PATH) env.PATH = filterTrustedExecutablePath(env.PATH, workspaceRoot);
   const credential = source.GITHUB_TOKEN || source.GITHUB_CODESPACE_TOKEN || source.GH_TOKEN;
   if (credential) env.GH_TOKEN = credential;
   return env;
