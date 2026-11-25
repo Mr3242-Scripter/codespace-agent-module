@@ -19,6 +19,25 @@ function safePath(input = "."): string {
   assertNoSymlinkComponents(root, target);
   return target;
 }
+async function readWorkspaceFileBounded(file: string, maxBytes: number): Promise<Buffer> {
+  const handle = await fs.open(file, "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("Workspace read target must be a regular file.");
+    if (stat.size > maxBytes) throw new Error(`Workspace file exceeds the ${Math.floor(maxBytes / 1024)} KiB read limit.`);
+    const buffer = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const result = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (!result.bytesRead) break;
+      offset += result.bytesRead;
+    }
+    return buffer.subarray(0, offset);
+  } finally { await handle.close(); }
+}
+async function readWorkspaceTextBounded(file: string, maxBytes: number): Promise<string> {
+  return (await readWorkspaceFileBounded(file, maxBytes)).toString("utf8");
+}
 async function command(bin: string, args: string[], timeout = 15000) {
   try {
     const result = await execFileAsync(bin, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: childEnv });
@@ -49,13 +68,16 @@ async function dockerEngineStatus() {
     operatingSystem: parsed.OperatingSystem ?? null
   };
 }
-async function walk(dir: string, base: string, files: Array<{path:string;size:number;modifiedAt:string}>, limit: number): Promise<void> {
+const MAX_WORKSPACE_TRAVERSAL_ENTRIES = 10_000;
+async function walk(dir: string, base: string, files: Array<{path:string;size:number;modifiedAt:string}>, state: { visited: number }, limit: number): Promise<void> {
   if (files.length >= limit) return;
-  for (const item of await fs.readdir(dir, { withFileTypes: true })) {
+  const directory = await fs.opendir(dir);
+  for await (const item of directory) {
+    if (++state.visited > MAX_WORKSPACE_TRAVERSAL_ENTRIES) throw new Error("Workspace manifest exceeds the 10000-entry traversal limit; narrow the workspace or exclude generated directories.");
     if ([".git","node_modules",".venv",".next","dist","build"].includes(item.name)) continue;
     const full = path.join(dir,item.name);
     if (item.isSymbolicLink()) continue;
-    if (item.isDirectory()) await walk(full,base,files,limit);
+    if (item.isDirectory()) await walk(full,base,files,state,limit);
     else if (item.isFile()) {
       const stat = await fs.stat(full);
       files.push({path:path.relative(base,full).split(path.sep).join("/"),size:stat.size,modifiedAt:stat.mtime.toISOString()});
@@ -65,12 +87,14 @@ async function walk(dir: string, base: string, files: Array<{path:string;size:nu
 }
 async function syncManifest() {
   const files: Array<{path:string;size:number;modifiedAt:string}> = [];
-  await walk(root,root,files,2000);
+  await walk(root,root,files,{visited:0},2000);
   return { root, count: files.length, files };
 }
 async function applyEdits(a: any) {
   const file = safePath(a.path);
-  const original = await fs.readFile(file,"utf8");
+  const stat = await fs.stat(file);
+  if (!stat.isFile() || stat.size > 10 * 1024 * 1024) throw new Error("Edited file must be a regular file no larger than 10 MiB.");
+  const original = await readWorkspaceTextBounded(file,10*1024*1024);
   const edits = a.edits as Array<{search:string;replace:string;all?:boolean}>;
   if (!Array.isArray(edits) || edits.length < 1 || edits.length > 100) throw new Error("edits must contain 1-100 exact-match edits.");
   let content = original;
@@ -120,9 +144,12 @@ async function syncFiles(a: any) {
     let total = 0;
     for (const entry of entries) {
       if (!entry || typeof entry.path !== "string" || !entry.path) throw new Error("Every download entry requires a workspace-relative path.");
-      const data = await fs.readFile(safePath(entry.path));
+      const file = safePath(entry.path);
+      const stat = await fs.stat(file);
+      if (!stat.isFile()) throw new Error(`Download target is not a regular file: ${entry.path}`);
+      if (stat.size > 1024 * 1024 || total + stat.size > 1024 * 1024) throw new Error("Batch sync exceeds 1 MiB; use resumable chunked transfer for larger files.");
+      const data = await fs.readFile(file);
       total += data.length;
-      if (total > 1024 * 1024) throw new Error("Batch sync exceeds 1 MiB; use resumable chunked transfer for larger files.");
       downloaded.push({ path: entry.path, contentBase64: data.toString("base64"), size: data.length });
     }
     return { direction, completed: downloaded.length, bytes: total, files: downloaded };
@@ -135,10 +162,14 @@ async function vscodeConfig(a: any) {
   const dir = safePath(".vscode");
   const file = safePath(path.join(".vscode",a.name));
   if (a.action === "read") {
-    try { return { path:path.relative(root,file), text:await fs.readFile(file,"utf8") }; }
+    try {
+      const stat=await fs.stat(file);
+      if(!stat.isFile()||stat.size>512*1024)throw new Error("VS Code configuration file exceeds the 512 KiB limit.");
+      return { path:path.relative(root,file), text:await readWorkspaceTextBounded(file,512*1024) }; }
     catch (error:any) { if (error?.code === "ENOENT") return { path:path.relative(root,file), found:false }; throw error; }
   }
   if (a.action !== "write" || typeof a.content !== "string") throw new Error("action must be read or write; write requires content.");
+  if(Buffer.byteLength(a.content,"utf8")>512*1024)throw new Error("VS Code configuration content exceeds the 512 KiB limit.");
   JSON.parse(a.content);
   await fs.mkdir(dir,{recursive:true});
   await fs.writeFile(file,a.content,"utf8");
@@ -195,7 +226,7 @@ async function runTask(task: string, args: string[] = [], timeoutMs = 120000) {
   if(!/^[A-Za-z0-9:_-]{1,80}$/.test(task))throw new Error("Invalid task name.");
   if(args.length>64||args.some(x=>x.length>2048))throw new Error("Task arguments exceed limits.");
   let pkg:any=null;
-  try{pkg=JSON.parse(await fs.readFile(safePath("package.json"),"utf8"));}catch(error:any){if(error?.code!=="ENOENT")throw error;}
+  try{pkg=JSON.parse(await readWorkspaceTextBounded(safePath("package.json"),1024*1024));}catch(error:any){if(error?.code!=="ENOENT")throw error;}
   const scripts=pkg?.scripts??{};
   const files=await fs.readdir(root);
   const manager=files.includes("pnpm-lock.yaml")?"pnpm":files.includes("yarn.lock")?"yarn":files.includes("bun.lockb")||files.includes("bun.lock")?"bun":"npm";
@@ -204,13 +235,17 @@ async function runTask(task: string, args: string[] = [], timeoutMs = 120000) {
     commandArgs=manager==="npm"?["run",task,"--",...args]:["run",task,...args];
   } else if(task==="test") {
     const tests:string[]=[];
+    let visitedTestEntries = 0;
     async function findTests(dir:string):Promise<void>{
-      for(const entry of await fs.readdir(dir,{withFileTypes:true})){
+      if(tests.length>=500)return;
+      const directory=await fs.opendir(dir);
+      for await(const entry of directory){
+        if(++visitedTestEntries>MAX_WORKSPACE_TRAVERSAL_ENTRIES)throw new Error("Test discovery exceeds the 10000-entry traversal limit; add a package.json test script or narrow the workspace.");
         if([".git","node_modules",".venv","dist","build"].includes(entry.name))continue;
         const full=path.join(dir,entry.name);
         if(entry.isDirectory())await findTests(full);
         else if(entry.isFile()&&/\.(?:test|spec)\.(?:js|mjs|cjs|ts|tsx|jsx)$/i.test(entry.name))tests.push(path.relative(root,full));
-        if(tests.length>=500)return;
+        if(tests.length>=500)break;
       }
     }
     await findTests(root);
@@ -362,7 +397,7 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
     }
     case "workspace.tasks.list": {
       let pkg:any=null;
-      try{pkg=JSON.parse(await fs.readFile(safePath("package.json"),"utf8"));}catch(error:any){if(error?.code!=="ENOENT")throw error;}
+      try{pkg=JSON.parse(await readWorkspaceTextBounded(safePath("package.json"),1024*1024));}catch(error:any){if(error?.code!=="ENOENT")throw error;}
       const make=await command("make",["-qp"]);
       const targets=[...make.stdout.matchAll(/^([A-Za-z0-9_.-]+):(?!=)/gm)].map(m=>m[1]).filter(x=>!x.startsWith("."));
       return {packageManager:(await fs.readdir(root)).includes("pnpm-lock.yaml")?"pnpm":(await fs.readdir(root)).includes("yarn.lock")?"yarn":"npm",scripts:pkg?.scripts??{},makeTargets:[...new Set(targets)].slice(0,300)};
@@ -439,7 +474,7 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       ]);
       let devcontainer: unknown = {found:false};
       for (const relative of [".devcontainer/devcontainer.json",".devcontainer.json"]) {
-        try { const raw=await fs.readFile(path.join(root,relative),"utf8"); JSON.parse(raw); devcontainer={found:true,path:relative,valid:true,validation:"static-json"}; break; }
+        try { const raw=await readWorkspaceTextBounded(safePath(relative),512*1024); JSON.parse(raw); devcontainer={found:true,path:relative,valid:true,validation:"static-json"}; break; }
         catch(error:any) { if(error?.code==="ENOENT") continue; devcontainer={found:true,path:relative,valid:false,error:error.message}; break; }
       }
       return {

@@ -431,7 +431,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
           for (const entry of entries) {
             const manifest = path.join(directory, entry, "package.json");
             try {
-              const pkg = JSON.parse(await fs.readFile(manifest, "utf8"));
+              const pkg = JSON.parse(await readFileBounded(manifest, 1024 * 1024));
               if (typeof pkg.publisher === "string" && typeof pkg.name === "string") {
                 extensions.push({ id: `${pkg.publisher}.${pkg.name}`, version: String(pkg.version ?? "unknown"), path: path.join(directory, entry) });
               }
@@ -457,7 +457,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       const candidates = [".devcontainer/devcontainer.json", ".devcontainer.json"];
       for (const relative of candidates) {
         const file = resolvePath(relative);
-        try { return { path: relative, text: await fs.readFile(file, "utf8") }; }
+        try { return { path: relative, text: await readFileBounded(file, 512 * 1024) }; }
         catch (error: any) { if (error?.code !== "ENOENT") throw error; }
       }
       return { found: false, candidates };
@@ -467,7 +467,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       const candidates = [a.config ? String(a.config) : ".devcontainer/devcontainer.json", ".devcontainer.json"];
       let selected: string | null = null, raw = "";
       for (const candidate of candidates) {
-        try { selected = candidate; raw = await fs.readFile(resolvePath(candidate), "utf8"); break; }
+        try { selected = candidate; raw = await readFileBounded(resolvePath(candidate), 512 * 1024); break; }
         catch (error: any) { if (error?.code !== "ENOENT") throw error; }
       }
       if (!selected) return { valid: false, found: false, candidates, reason: "No devcontainer configuration file was found." };
