@@ -4,8 +4,10 @@ import { readFile, writeFile, mkdir, copyFile, access, lstat, rename, unlink } f
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import os from "node:os";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { createInstallerEnv } from "./install-utils.mjs";
 
 const moduleRoot = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -15,22 +17,8 @@ const valueAfter = (flag, fallback) => {
 };
 const targetRoot = path.resolve(valueAfter("--target", process.cwd()));
 const skipInstall = args.includes("--no-install");
-const installerEnv = { ...process.env };
-const sensitiveEnvName = /(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|KEY|COOKIE|AUTH|CREDENTIAL|CERT|PRIVATE|SESSION|ASKPASS|ACCESS|AGENT|SOCKET)/i;
-const cloudCredentialEnvName = /^(?:AWS_|AZURE_|ARM_|GOOGLE_|GCLOUD_|CLOUDSDK_|GCP_|VAULT_|TF_VAR_|KUBECONFIG$|DOCKER_CONFIG$)/i;
-const executionEnvName = /^(?:NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|LD_.*|DYLD_.*|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|GIT_.*|DOCKER_HOST|DOCKER_CONTEXT|CONTAINER_HOST|COREPACK_.*|NPM_CONFIG_.*|npm_config_.*)$/i;
-for (const name of Object.keys(installerEnv)) {
-  if (sensitiveEnvName.test(name) || cloudCredentialEnvName.test(name) || executionEnvName.test(name)) delete installerEnv[name];
-}
 const targetRootReal = realpathSync(targetRoot);
-const safePath = [];
-for (const directory of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
-  try {
-    const resolved = realpathSync(path.resolve(directory));
-    if (resolved !== targetRootReal && !resolved.startsWith(targetRootReal + path.sep) && !safePath.includes(resolved)) safePath.push(resolved);
-  } catch {}
-}
-installerEnv.PATH = safePath.join(path.delimiter);
+const installerEnv = createInstallerEnv(process.env, targetRootReal, os.homedir(), os.tmpdir());
 const manifest = JSON.parse(await readFile(path.join(moduleRoot, "module.json"), "utf8"));
 const destination = path.join(targetRoot, ".codespace-agent");
 const packagePath = path.join(targetRoot, "package.json");

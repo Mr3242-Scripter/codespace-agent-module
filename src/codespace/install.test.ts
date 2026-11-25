@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createInstallerEnv } from "./install-utils.mjs";
 
 const installer = path.join(path.dirname(fileURLToPath(import.meta.url)), "install.mjs");
 
@@ -46,65 +47,37 @@ test("portable installer rejects a symlinked module destination", async t => {
   }
 });
 
-test("portable installer strips credentials and workspace npm shims before package scripts", async () => {
+test("installer environment rejects user-writable PATH entries and strips inherited credentials", async () => {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-installer-env-"));
   const target = path.join(parent, "target");
-  const bin = path.join(parent, "bin");
-  const workspaceBin = path.join(target, "node_modules", ".bin");
+  const userBin = path.join(parent, "user-bin");
   try {
-    await fs.mkdir(workspaceBin, { recursive: true });
-    await fs.mkdir(bin, { recursive: true });
-    await fs.writeFile(path.join(target, "package.json"), JSON.stringify({ name: "fixture" }));
-    const workspaceAlias = path.join(parent, "workspace-bin-alias");
-    await fs.symlink(workspaceBin, workspaceAlias, "dir");
-    await fs.writeFile(path.join(workspaceBin, "npm"), "#!/usr/bin/env bash\necho hijacked > \"$NPM_HIJACK_MARKER\"\nexit 99\n", { mode: 0o755 });
-    await fs.writeFile(path.join(bin, "npm"), [
-      "#!/usr/bin/env bash",
-      "for name in CODESPACE_AGENT_TOKEN GITHUB_TOKEN GITHUB_CODESPACE_TOKEN GH_TOKEN NODE_AUTH_TOKEN NPM_TOKEN GIT_ASKPASS AWS_SECRET_ACCESS_KEY AZURE_CLIENT_SECRET GOOGLE_APPLICATION_CREDENTIALS NODE_OPTIONS NODE_PATH GIT_CONFIG_COUNT GIT_SSH_COMMAND DOCKER_HOST PYTHONPATH GPG_AGENT_INFO; do",
-      "  if [[ -n \"${!name:-}\" ]]; then printf '%s=present\\n' \"$name\" >> \"$INSTALLER_ENV_CAPTURE\"; else printf '%s=missing\\n' \"$name\" >> \"$INSTALLER_ENV_CAPTURE\"; fi",
-      "done",
-      "printf '%s\\n' '--- invocation ---' >> \"$INSTALLER_ENV_CAPTURE\"",
-      "exit 0"
-    ].join("\n"), { mode: 0o755 });
-
-    const result = spawnSync(process.execPath, [installer, "--target", target], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: [workspaceAlias, workspaceBin, bin, process.env.PATH].join(path.delimiter),
-        CODESPACE_AGENT_TOKEN: "agent-secret",
-        GITHUB_TOKEN: "github-secret",
-        GITHUB_CODESPACE_TOKEN: "codespace-secret",
-        GH_TOKEN: "gh-secret",
-        NODE_AUTH_TOKEN: "npm-secret",
-        NPM_TOKEN: "npm-secret-2",
-        GIT_ASKPASS: "/tmp/fake-askpass",
-        AWS_SECRET_ACCESS_KEY: "aws-secret",
-        AZURE_CLIENT_SECRET: "azure-secret",
-        GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcp.json",
-        NODE_OPTIONS: "--no-warnings",
-        NODE_PATH: "/tmp/node-modules",
-        GIT_CONFIG_COUNT: "1",
-        GIT_SSH_COMMAND: "fake-ssh",
-        DOCKER_HOST: "tcp://127.0.0.1:2375",
-        PYTHONPATH: "/tmp/python",
-        GPG_AGENT_INFO: "/tmp/gpg-agent",
-        INSTALLER_ENV_CAPTURE: path.join(parent, "installer-env.txt"),
-        NPM_HIJACK_MARKER: path.join(parent, "npm-hijacked")
-      }
-    });
-    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-    assert.equal(await fs.access(path.join(parent, "npm-hijacked")).then(() => true).catch(() => false), false);
-    const capture = await fs.readFile(path.join(parent, "installer-env.txt"), "utf8");
-    assert.equal(capture.split("--- invocation ---").length - 1, 2, "installer should invoke npm install and verification");
-    assert.doesNotMatch(capture, /=(?:present)/, "npm install and verification must not inherit credentials or askpass access");
-    assert.match(capture, /CODESPACE_AGENT_TOKEN=missing/);
-    assert.match(capture, /GITHUB_TOKEN=missing/);
-    assert.match(capture, /NODE_AUTH_TOKEN=missing/);
-    assert.match(capture, /AWS_SECRET_ACCESS_KEY=missing/);
-    assert.match(capture, /NODE_OPTIONS=missing/);
-    assert.match(capture, /GIT_CONFIG_COUNT=missing/);
-    assert.match(capture, /DOCKER_HOST=missing/);
+    await fs.mkdir(target);
+    await fs.mkdir(userBin);
+    const workspaceAlias = path.join(parent, "workspace-alias");
+    await fs.symlink(target, workspaceAlias, "dir");
+    const source = {
+      PATH: [workspaceAlias, userBin, "/usr/local/share/npm-global/bin", "/usr/local/bin", "/usr/bin", os.homedir(), os.tmpdir()].join(path.delimiter),
+      CODESPACE_AGENT_TOKEN: "agent-secret", GITHUB_TOKEN: "github-secret", GITHUB_CODESPACE_TOKEN: "codespace-secret",
+      GH_TOKEN: "gh-secret", NODE_AUTH_TOKEN: "npm-secret", NPM_TOKEN: "npm-secret-2",
+      GIT_ASKPASS: "/tmp/fake-askpass", AWS_SECRET_ACCESS_KEY: "aws-secret", AZURE_CLIENT_SECRET: "azure-secret",
+      GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcp.json", NODE_OPTIONS: "--no-warnings", NODE_PATH: "/tmp/node-modules",
+      GIT_CONFIG_COUNT: "1", GIT_SSH_COMMAND: "fake-ssh", DOCKER_HOST: "tcp://127.0.0.1:2375",
+      PYTHONPATH: "/tmp/python", GPG_AGENT_INFO: "/tmp/gpg-agent", SAFE_VALUE: "preserved"
+    };
+    const env = createInstallerEnv(source, target, os.homedir(), os.tmpdir());
+    const entries = env.PATH.split(path.delimiter);
+    assert.ok(entries.includes("/usr/local/bin"));
+    assert.ok(entries.includes("/usr/bin"));
+    assert.ok(!entries.includes(userBin));
+    assert.ok(!entries.includes(workspaceAlias));
+    assert.ok(!entries.includes("/usr/local/share/npm-global/bin"));
+    assert.ok(!entries.includes(os.homedir()));
+    assert.ok(!entries.includes(os.tmpdir()));
+    for (const name of ["CODESPACE_AGENT_TOKEN", "GITHUB_TOKEN", "GITHUB_CODESPACE_TOKEN", "GH_TOKEN", "NODE_AUTH_TOKEN", "NPM_TOKEN", "GIT_ASKPASS", "AWS_SECRET_ACCESS_KEY", "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "NODE_OPTIONS", "NODE_PATH", "GIT_CONFIG_COUNT", "GIT_SSH_COMMAND", "DOCKER_HOST", "PYTHONPATH", "GPG_AGENT_INFO"]) {
+      assert.equal(env[name], undefined, name + " must be removed");
+    }
+    assert.equal(env.SAFE_VALUE, "preserved");
   } finally {
     await fs.rm(parent, { recursive: true, force: true });
   }

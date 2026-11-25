@@ -51,6 +51,7 @@
     "tsconfig.json",
     "package.json",
     "README.md",
-    "module.json"
+    "module.json",
+    "install-utils.mjs"
   ]
 }

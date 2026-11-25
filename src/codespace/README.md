@@ -83,7 +83,7 @@ Required system executables: Python 3, pip, Git, Docker CLI, GitHub CLI (`gh`), 
 - Forwarded-port checks are restricted to localhost and loopback IP addresses. Changing a forwarded port to `public` requires explicit `confirm: true`.
 - Resumable uploads without overwrite permission use an atomic same-filesystem no-replace link at commit time, preventing a destination created after upload start from being overwritten.
 - Process listing and inspection omit raw command-line arguments to reduce accidental disclosure of credentials passed through process arguments.
-- The portable installer canonicalizes PATH entries before excluding workspace shims, rejects symlinked destination paths, uses exclusive payload copies and atomic configuration writes, and strips inherited credentials before npm lifecycle scripts.
+- The portable installer canonicalizes PATH entries and retains only root-owned, non-group/world-writable system directories (excluding workspace, home, and temporary paths), rejects symlinked destination paths, uses exclusive payload copies and atomic configuration writes, and strips inherited credentials before npm lifecycle scripts.
 
 ## Commands
 
