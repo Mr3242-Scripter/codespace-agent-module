@@ -248,7 +248,7 @@ The installer intentionally refuses to overwrite a different existing runtime fi
 
 This project is distributed as a source module in `src/codespace/`; it is not currently published as an npm package or a prebuilt container image.
 
-Before inviting external contributions or reuse, add a license that reflects the maintainer's intended terms. No license file is currently included in this repository. Making the repository public does not, by itself, grant permission to redistribute or modify the code.
+This repository is licensed under the [MIT License](LICENSE). You may use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the software, subject to the license conditions and warranty disclaimer.
 
 ## Additional documentation
 
