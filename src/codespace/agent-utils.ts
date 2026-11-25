@@ -169,6 +169,10 @@ export function validateGitBranchArgument(value: unknown): string {
   return branch;
 }
 
+export function gitCommitSafetyConfig(): string[] {
+  return ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false"];
+}
+
 export function gitRemoteSafetyConfig(githubHost: string | null = null): string[] {
   const args = [
     "-c", "protocol.ext.allow=never",

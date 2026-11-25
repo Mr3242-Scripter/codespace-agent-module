@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
+import { execFileSync } from "node:child_process";
+import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, assertUploadCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitCommitSafetyConfig, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, inspectArchiveListing, isExpired, isLoopbackHost, linkFileNoReplace, matchesFilenamePattern, parseMakeTargets, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow, writeFilesAtomically } from "./agent-utils.js";
 
 test("filename matching supports glob wildcards and legacy substring searches", () => {
   assert.equal(matchesFilenamePattern("nested/report.txt", "*.txt"), true);
@@ -336,6 +337,30 @@ test("Git remote operations disable hooks, external transports, ambient credenti
   const github = gitRemoteSafetyConfig("github.com");
   assert.ok(github.includes("credential.https://github.com.helper=!gh auth git-credential"));
   assert.ok(github.includes("credential.https://github.com.helper="));
+});
+
+test("agent Git commits disable repository hooks and automatic signing", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codespace-git-hooks-"));
+  try {
+    execFileSync("git", ["init", dir], { stdio: "ignore" });
+    execFileSync("git", ["-C", dir, "config", "user.name", "Test User"]);
+    execFileSync("git", ["-C", dir, "config", "user.email", "test@example.invalid"]);
+    const hookDir = path.join(dir, ".git", "hooks");
+    await fs.mkdir(hookDir, { recursive: true });
+    const marker = path.join(dir, "hook-executed");
+    const hook = path.join(hookDir, "pre-commit");
+    await fs.writeFile(hook, `#!/bin/sh\ntouch '${marker}'\n`);
+    await fs.chmod(hook, 0o755);
+    await fs.writeFile(path.join(dir, "tracked.txt"), "safe\n");
+    execFileSync("git", ["-C", dir, "add", "tracked.txt"]);
+    const safe = gitCommitSafetyConfig();
+    assert.ok(safe.includes("core.hooksPath=/dev/null"));
+    assert.ok(safe.includes("commit.gpgSign=false"));
+    execFileSync("git", [...safe, "-C", dir, "commit", "-m", "test commit"], { stdio: "ignore" });
+    await assert.rejects(fs.access(marker));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Git branch arguments reject option and force-push refspec prefixes", () => {

@@ -8,7 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { executeAdvanced } from "./advanced.js";
-import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
+import { assertNoHardLinksInTree, assertNoSymlinkComponents, assertProtocolBufferCapacity, assertProtocolHeaderCapacity, assertProtocolQueueCapacity, createBoundedFileSnapshot, createChildProcessEnv, createGitHubCliEnv, filterTrustedExecutablePath, getGitHubHttpsRemoteHost, gitCommitSafetyConfig, gitRemoteSafetyConfig, validateGitBranchArgument, validateGitTagArgument, readFileBounded, readFileBufferBounded, inspectArchiveListing, isLoopbackHost, matchesFilenamePattern, pruneEndedSessions, requirePublicPortConfirmation, requireTrackedSession, resolveTrustedExecutable, validateRelayUrl, writeFileNoFollow } from "./agent-utils.js";
 
 const execFileAsync = promisify(execFile);
 const localRequire = createRequire(import.meta.url);
@@ -385,7 +385,7 @@ async function execute(operation: string, a: Record<string, any>): Promise<unkno
       const cwd = a.cwd ? resolvePath(a.cwd) : root;
       if (a.all) await run("git", ["add", "-A"], cwd);
       await assertNoHardLinksInGitIndex(cwd);
-      return run("git", ["commit", "-m", String(a.message)], cwd, 120_000);
+      return run("git", [...gitCommitSafetyConfig(), "commit", "-m", String(a.message)], cwd, 120_000);
     }
     case "git.fetch": return runGitRemoteOperation("fetch", a.remote, undefined, a.cwd ? resolvePath(a.cwd) : root);
     case "git.add": {
