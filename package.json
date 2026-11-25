@@ -12,7 +12,7 @@
     "check:agent": "npm run agent:check-deps && npm run typecheck && npm run test:agent"
   },
   "devDependencies": {
-    "@devcontainers/cli": "^0.80.0",
+    "@devcontainers/cli": "^0.91.0",
     "@types/node": "^22.20.5",
     "bash-language-server": "^3.3.1",
     "node-pty": "^1.1.0",
