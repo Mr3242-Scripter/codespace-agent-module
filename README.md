@@ -53,16 +53,6 @@ To make Codespaces build and use the configured container:
 
 After the full rebuild, Codespaces uses the Dev Container configuration committed in this repository. The agent lifecycle hooks attempt to start the agent after container start and attachment; the agent will remain stopped until its required relay environment variables are configured.
 
-### Before making the repository public
-
-Once the full rebuild and checks succeed, review the repository for anything that must not be published (tokens, secrets, private URLs, personal data, local files, and unintended history content). Then change the repository visibility in GitHub:
-
-1. Open the repository on GitHub.
-2. Go to **Settings → General → Danger Zone**.
-3. Select **Change repository visibility**, choose **Public**, and complete GitHub's confirmation steps.
-
-Making the repository public publishes its source and history; it does not deploy the MCP relay or automatically publish a container image. This repository is intended to be consumed as a source module from `src/codespace/`.
-
 ## Install the module into another repository
 
 ### Requirements
