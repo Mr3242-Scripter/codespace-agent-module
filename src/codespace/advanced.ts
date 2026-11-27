@@ -488,6 +488,7 @@ export async function executeAdvanced(operation: string, a: Record<string, any>)
       if(body.length>8*1024*1024)throw new Error("LSP message exceeds 8 MiB.");
       const frame=Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`),body]);
       const writable=session.child.stdin;
+      if(!writable)throw new Error("Language-server input stream is unavailable.");
       if(writable.writableLength+frame.length>MAX_PROTOCOL_QUEUE_BYTES)throw new Error("Language-server input backpressure limit exceeded.");
       if(!writable.write(frame))await new Promise<void>((resolve,reject)=>{const timer=setTimeout(()=>{cleanup();reject(new Error("Language-server input drain timed out."));},10000);const cleanup=()=>{clearTimeout(timer);writable.off("drain",onDrain);writable.off("error",onError);writable.off("close",onClose);};const onDrain=()=>{cleanup();resolve();};const onError=(error:Error)=>{cleanup();reject(error);};const onClose=()=>{cleanup();reject(new Error("Language-server input closed before draining."));};writable.once("drain",onDrain);writable.once("error",onError);writable.once("close",onClose);});
       return {sent:true,bytes:body.length};
