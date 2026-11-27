@@ -11,4 +11,4 @@ export function createInstallerEnv(
   targetRoot: string,
   homeDirectory: string,
   temporaryDirectory: string
-): NodeJS.ProcessEnv;
+): NodeJS.ProcessEnv & { PATH: string };
